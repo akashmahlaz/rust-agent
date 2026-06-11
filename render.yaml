@@ -4,6 +4,7 @@
 services:
   - type: web
     name: operon-backend
+    runtime: rust
     region: singapore
     plan: free
     autoDeploy: true
@@ -11,7 +12,7 @@ services:
 
     # Build settings
     buildCommand: cargo build --release
-    startCommand: server
+    startCommand: ./target/release/server
 
     # Environment variables (set in Render dashboard for security)
     envVars:
