@@ -1,0 +1,37 @@
+# Render.com Blueprint
+# Auto-deploys Rust backend on every push to main
+
+services:
+  - type: web
+    name: operon-backend
+    region: singapore
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /healthz
+
+    # Build settings
+    buildCommand: cargo build --release
+    startCommand: server
+
+    # Environment variables (set in Render dashboard for security)
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: OPERON_JWT_SECRET
+        sync: false
+      - key: OPERON_WEB_ORIGIN
+        value: https://bematterfull.fireclaw.in
+      - key: OPERON_OAUTH_REDIRECT_BASE
+        value: https://bematterfull.fireclaw.in
+      - key: OPERON_NEXT_BASE_URL
+        value: https://bematterfull.fireclaw.in
+      - key: OPERON_COOKIE_SECURE
+        value: "true"
+      - key: OPERON_API_BIND
+        value: "0.0.0.0:8080"
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: RUST_LOG
+        value: info
