@@ -157,7 +157,10 @@ pub async fn create_upload(
         && state.config.aws_access_key.is_some()
         && state.config.aws_secret_key.is_some();
 
+    tracing::info!(has_s3 = has_s3, filename = %original_filename, size_bytes = size, "upload: deciding storage path");
+
     if has_s3 {
+        tracing::info!("upload: using S3 storage");
         upload_to_s3(&state, &key, &original_filename, &content_type, bytes, size, user_id, conversation_id).await
     } else {
         tracing::warn!(
@@ -207,7 +210,9 @@ async fn upload_to_s3(
         .build();
     let client = aws_sdk_s3::Client::from_conf(s3_config);
 
-    client
+    tracing::info!(region = %region, bucket = %bucket, s3_key = %s3_key, "upload: starting S3 upload");
+
+    let result = client
         .put_object()
         .bucket(bucket)
         .key(&s3_key)
@@ -218,11 +223,17 @@ async fn upload_to_s3(
             original_filename.replace('"', "'")
         ))
         .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, s3_key = %s3_key, bucket = %bucket, "upload: S3 put failed");
-            AppError::Internal(format!("S3 upload failed: {e}"))
-        })?;
+        .await;
+
+    match result {
+        Ok(_) => {
+            tracing::info!(s3_key = %s3_key, "upload: S3 put_object succeeded");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, s3_key = %s3_key, bucket = %bucket, region = %region, "upload: S3 put_object FAILED");
+            return Err(AppError::Internal(format!("S3 upload failed: {e}")));
+        }
+    }
 
     let encoded_key = s3_key
         .split('/')
@@ -297,10 +308,14 @@ async fn upload_to_local(
         AppError::Internal(format!("Failed to write file to disk: {e}"))
     })?;
 
-    // Proxy route: Next.js rewrites /operon-api/* → rust server, so we target
-    // the rust server's own bind address for local files.
-    let bind = format!("http://{}", state.config.bind_addr);
-    let public_url = format!("{bind}/local-uploads/{key}");
+    // Use OPERON_PUBLIC_URL when set (required in production where the Rust
+    // server's bind address is an internal socket, not the public domain).
+    // Example: OPERON_PUBLIC_URL=https://api.operon.ai
+    // Falls back to bind_addr for local dev (zero-config).
+    let public_base = std::env::var("OPERON_PUBLIC_URL")
+        .map(|u| u.trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| format!("http://{}", state.config.bind_addr));
+    let public_url = format!("{public_base}/local-uploads/{key}");
 
     // Store file metadata if user is authenticated
     let file_id = if let (Some(uid), Some(cid)) = (user_id, conversation_id) {

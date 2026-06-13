@@ -295,6 +295,27 @@ pub fn spawn(spec: RunnerSpec) -> RunHandle {
 async fn run(spec: RunnerSpec, handle: RunHandle) -> Result<()> {
     set_status(&spec.db, spec.run_id, RunStatus::Running, None).await?;
 
+    tracing::info!(
+        run_id = %spec.run_id,
+        user_id = %spec.user_id,
+        conversation_id = %spec.conversation_id,
+        provider = %spec.provider,
+        model = %spec.model,
+        channel = %spec.channel,
+        attachment_count = spec.initial_user_attachments.len(),
+        prompt_len = spec.initial_user_message.len(),
+        "agent_run_start"
+    );
+    for att in &spec.initial_user_attachments {
+        tracing::info!(
+            run_id = %spec.run_id,
+            url = %att.url,
+            name = %att.name.as_deref().unwrap_or(""),
+            mime = %att.mime_type.as_deref().unwrap_or(""),
+            "agent_run_attachment"
+        );
+    }
+
     let client = Client::builder()
         // Long-running streams (many tool steps) can exceed 2 minutes.
         .timeout(std::time::Duration::from_secs(600))
@@ -1522,13 +1543,25 @@ fn build_initial_user_content(text: &str, attachments: &[AttachmentInput]) -> Va
     if attachments.is_empty() {
         return Value::String(text.to_owned());
     }
+    tracing::info!(
+        attachment_count = attachments.len(),
+        "attachment_processing_start"
+    );
     let mut parts: Vec<Value> = Vec::with_capacity(attachments.len() + 1);
     if !text.is_empty() {
         parts.push(json!({ "type": "text", "text": text }));
     }
     for att in attachments {
         let mime = att.mime_type.as_deref().unwrap_or("");
+        let label = att.name.as_deref().unwrap_or("file");
+        tracing::info!(
+            url = %att.url,
+            mime = %mime,
+            name = %label,
+            "attachment_processing"
+        );
         if mime.starts_with("image/") {
+            tracing::info!(url = %att.url, mime = %mime, "attachment_image_url");
             parts.push(json!({
                 "type": "image_url",
                 "image_url": { "url": att.url },
@@ -1536,10 +1569,16 @@ fn build_initial_user_content(text: &str, attachments: &[AttachmentInput]) -> Va
         } else {
             // Non-image attachments: include file content inline when possible.
             // Try to fetch the content from the URL so the model can read it.
-            let label = att.name.as_deref().unwrap_or("file");
             let content = fetch_file_content_sync(&att.url);
             match content {
-                Some(text_content) if text_content.len() <= 200_000 => {
+                Some(ref text_content) if text_content.len() <= 200_000 => {
+                    tracing::info!(
+                        url = %att.url,
+                        name = %label,
+                        mime = %mime,
+                        content_bytes = text_content.len(),
+                        "attachment_inlined"
+                    );
                     parts.push(json!({
                         "type": "text",
                         "text": format!(
@@ -1547,7 +1586,27 @@ fn build_initial_user_content(text: &str, attachments: &[AttachmentInput]) -> Va
                         ),
                     }));
                 }
-                _ => {
+                Some(ref text_content) => {
+                    tracing::warn!(
+                        url = %att.url,
+                        name = %label,
+                        content_bytes = text_content.len(),
+                        limit = 200_000usize,
+                        "attachment_too_large_fallback"
+                    );
+                    parts.push(json!({
+                        "type": "text",
+                        "text": format!("[Attached file '{label}' ({mime}) — {bytes} bytes, too large to inline: {url}]",
+                            label = label, mime = mime, bytes = text_content.len(), url = att.url),
+                    }));
+                }
+                None => {
+                    tracing::warn!(
+                        url = %att.url,
+                        name = %label,
+                        mime = %mime,
+                        "attachment_fetch_failed_fallback"
+                    );
                     // Fallback: just mention the file
                     parts.push(json!({
                         "type": "text",
@@ -1563,23 +1622,69 @@ fn build_initial_user_content(text: &str, attachments: &[AttachmentInput]) -> Va
 
 /// Attempt to read file content from a URL (blocking, best-effort).
 /// Used to inline text file contents into the LLM context.
+/// Returns a descriptive error string for binary/unreadable files so the
+/// model receives honest context instead of a bare URL it tries to web_fetch.
 fn fetch_file_content_sync(url: &str) -> Option<String> {
-    // For local uploads, read directly from disk
+    // For local uploads, read directly from disk (avoids network round-trip
+    // and works even when the server's bind address is not publicly routable).
     if url.contains("/local-uploads/") {
-        let filename = url.rsplit('/').next()?;
-        let path = std::path::Path::new("./local_uploads").join(filename);
-        return std::fs::read_to_string(&path).ok();
+        // Extract key from URL (last path segment, may be URL-encoded)
+        let raw_filename = url.rsplit('/').next()?;
+        let filename = urlencoding::decode(raw_filename)
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|_| raw_filename.to_string());
+        let path = std::path::Path::new("./local_uploads").join(&filename);
+        tracing::debug!(url = %url, path = %path.display(), "fetch_file_content_sync: reading local file");
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(url = %url, path = %path.display(), error = %e, "fetch_file_content_sync: disk read failed");
+                return None;
+            }
+        };
+        // Detect PDF by magic bytes — return a clear message instead of binary garbage
+        if bytes.starts_with(b"%PDF") {
+            tracing::info!(url = %url, bytes = bytes.len(), "fetch_file_content_sync: PDF detected, returning guidance message");
+            return Some(
+                "[This is a PDF file (binary). The raw bytes cannot be read as text. \
+                 Inform the user that PDF text extraction is not available: ask them \
+                 to copy-paste the relevant text, or describe what information they \
+                 need from the document.]"
+                    .to_string(),
+            );
+        }
+        // Generic binary heuristic: >30% non-printable bytes in first 512
+        let sample = &bytes[..bytes.len().min(512)];
+        let non_printable = sample
+            .iter()
+            .filter(|&&b| b < 0x09 || (b > 0x0D && b < 0x20) || b == 0x7F)
+            .count();
+        if non_printable * 10 > sample.len() * 3 {
+            tracing::info!(url = %url, bytes = bytes.len(), non_printable, "fetch_file_content_sync: binary file detected, returning guidance message");
+            return Some(format!(
+                "[Binary file ({} bytes) — cannot be read as plain text. \
+                 Ask the user to provide the content in a text format.]",
+                bytes.len()
+            ));
+        }
+        let result = String::from_utf8(bytes).ok();
+        tracing::info!(url = %url, success = result.is_some(), "fetch_file_content_sync: local file read complete");
+        return result;
     }
     // For remote URLs, use a quick blocking fetch
+    tracing::debug!(url = %url, "fetch_file_content_sync: fetching remote url");
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .ok()?;
     let resp = client.get(url).send().ok()?;
     if !resp.status().is_success() {
+        tracing::warn!(url = %url, status = resp.status().as_u16(), "fetch_file_content_sync: remote fetch failed");
         return None;
     }
-    resp.text().ok()
+    let text = resp.text().ok();
+    tracing::info!(url = %url, success = text.is_some(), "fetch_file_content_sync: remote fetch complete");
+    text
 }
 
 /// Simple heuristic title generation from user prompt (no LLM call needed).

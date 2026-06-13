@@ -1638,6 +1638,28 @@ async fn web_fetch(ctx: &AgentContext, input: &Value) -> Result<Value> {
         .and_then(|h| h.to_str().ok())
         .unwrap_or("")
         .to_string();
+
+    // Refuse to return binary file data as text — it would be garbled garbage
+    // that confuses the model and wastes tokens. Return a clear error instead.
+    let is_binary_mime = content_type.contains("pdf")
+        || content_type.contains("msword")
+        || content_type.contains("officedocument")
+        || content_type.contains("zip")
+        || content_type.contains("octet-stream")
+        || (content_type.starts_with("application/") && !content_type.contains("json") && !content_type.contains("xml") && !content_type.contains("javascript") && !content_type.contains("text"));
+    if is_binary_mime {
+        return Ok(json!({
+            "url": args.url,
+            "status": status,
+            "content_type": content_type,
+            "error": format!(
+                "Binary file detected ({content_type}) — cannot extract text. \
+                 If this is a user-uploaded file, ask the user to provide the \
+                 text content directly instead of uploading a binary document."
+            ),
+        }));
+    }
+
     let body = resp.text().await.context("reading response body")?;
 
     // Strip HTML tags for a readable extraction (simple approach)
