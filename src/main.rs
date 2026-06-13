@@ -22,7 +22,6 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
-    db::migrate(&pool).await?;
 
     let state = AppState {
         codex: CodexBridge::new(config.codex_command.clone()),

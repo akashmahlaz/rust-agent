@@ -2657,6 +2657,8 @@ async fn web_scrape(ctx: &AgentContext, input: &Value) -> Result<Value> {
 
 // ============ CLOUD INTEGRATION TOOLS ============
 
+use aws_sdk_s3::primitives::ByteStream;
+
 async fn aws_s3_list(_ctx: &AgentContext, input: &Value) -> Result<Value> {
     #[derive(Deserialize)]
     struct Args {
@@ -2670,30 +2672,47 @@ async fn aws_s3_list(_ctx: &AgentContext, input: &Value) -> Result<Value> {
     fn default_max_keys() -> Option<i32> { Some(100) }
 
     let args: Args = serde_json::from_value(input.clone())?;
+    let max_keys = args.max_keys.unwrap_or(100).min(1000) as i32;
 
-    // Get AWS credentials from config or ctx
-    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "ap-south-1".to_string());
+    let bucket_name = args.bucket.unwrap_or_else(||
+        std::env::var("AWS_BUCKET_NAME").unwrap_or_default()
+    );
 
-    if let Some(bucket) = args.bucket {
-        // List objects in bucket
-        let prefix = args.prefix.unwrap_or_default();
-        let marker = args.max_keys.unwrap_or(100);
-
-        Ok(json!({
-            "bucket": bucket,
-            "prefix": prefix,
-            "max_keys": marker,
-            "region": region,
-            "note": "S3 listing requires AWS SDK. Configure AWS credentials for full functionality."
-        }))
-    } else {
-        // List buckets
-        Ok(json!({
-            "buckets": [],
-            "region": region,
-            "note": "Configure AWS_ACCESS_KEY and AWS_SECRET_KEY env vars for S3 access."
-        }))
+    if bucket_name.is_empty() {
+        return Err(anyhow::anyhow!("Bucket name required. Set AWS_BUCKET_NAME env var or pass bucket parameter."));
     }
+
+    let config = aws_config::from_env().load().await;
+    let client = aws_sdk_s3::Client::new(&config);
+
+    let resp = client
+        .list_objects_v2()
+        .bucket(&bucket_name)
+        .prefix(args.prefix.as_deref().unwrap_or(""))
+        .max_keys(max_keys)
+        .send()
+        .await
+        .context("S3 list objects failed")?;
+
+    let objects: Vec<Value> = resp.contents()
+        .iter()
+        .map(|obj| {
+            json!({
+                "key": obj.key().unwrap_or(""),
+                "size_bytes": obj.size(),
+                "etag": obj.e_tag().unwrap_or("")
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "bucket": bucket_name,
+        "prefix": args.prefix.unwrap_or_default(),
+        "region": region,
+        "count": objects.len(),
+        "objects": objects
+    }))
 }
 
 async fn aws_s3_read(_ctx: &AgentContext, input: &Value) -> Result<Value> {
@@ -2704,10 +2723,33 @@ async fn aws_s3_read(_ctx: &AgentContext, input: &Value) -> Result<Value> {
     }
     let args: Args = serde_json::from_value(input.clone())?;
 
+    let config = aws_config::from_env().load().await;
+    let client = aws_sdk_s3::Client::new(&config);
+
+    let resp = client
+        .get_object()
+        .bucket(&args.bucket)
+        .key(&args.key)
+        .send()
+        .await
+        .context(format!("S3 read failed for {}/{}", args.bucket, args.key))?;
+
+    let body = resp.body.collect().await
+        .context("S3 read body collection failed")?;
+    let bytes = body.into_bytes();
+    let size = bytes.len();
+
+    // Try to convert to string for text files
+    let content = String::from_utf8(bytes.to_vec())
+        .map(|s| s.clone())
+        .ok();
+
     Ok(json!({
         "bucket": args.bucket,
         "key": args.key,
-        "note": "S3 read requires AWS SDK. Configure AWS credentials for full functionality."
+        "size_bytes": size,
+        "content": content,
+        "is_binary": content.is_none()
     }))
 }
 
@@ -2721,13 +2763,32 @@ async fn aws_s3_write(_ctx: &AgentContext, input: &Value) -> Result<Value> {
         content_type: Option<String>,
     }
     let args: Args = serde_json::from_value(input.clone())?;
+    let body_len = args.body.len();
+
+    let config = aws_config::from_env().load().await;
+    let client = aws_sdk_s3::Client::new(&config);
+
+    let body_bytes = ByteStream::from(args.body.into_bytes());
+
+    let mut put_builder = client
+        .put_object()
+        .bucket(&args.bucket)
+        .key(&args.key)
+        .body(body_bytes);
+
+    if let Some(ref ct) = args.content_type {
+        put_builder = put_builder.content_type(ct);
+    }
+
+    put_builder.send().await
+        .context(format!("S3 write failed for {}/{}", args.bucket, args.key))?;
 
     Ok(json!({
         "bucket": args.bucket,
         "key": args.key,
-        "body_length": args.body.len(),
+        "body_length": body_len,
         "content_type": args.content_type,
-        "note": "S3 write requires AWS SDK. Configure AWS credentials for full functionality."
+        "status": "uploaded"
     }))
 }
 
