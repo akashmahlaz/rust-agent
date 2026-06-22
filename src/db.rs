@@ -13,6 +13,7 @@ pub async fn connect(database_url: &str) -> Result<Pool<Postgres>> {
     Ok(pool)
 }
 
+#[allow(dead_code)]
 pub async fn migrate(pool: &Pool<Postgres>) -> Result<()> {
     sqlx::migrate!("./migrations").run(pool).await?;
     Ok(())

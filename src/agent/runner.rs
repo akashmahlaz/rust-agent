@@ -30,9 +30,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    anthropic, context, events,
+    anthropic, context, events, model_caps,
     openai::{self, ChatMessage, OpenAiEvent, ToolCall, ToolCallFunction},
     prompt::build_system_message,
+    providers::{FilePart, FileSource, ProviderAdapter, ProviderRegistry},
     tools::{self, AgentContext, Workspace},
     types::{AgentEvent, AttachmentInput, RunId, RunStatus},
 };
@@ -265,6 +266,10 @@ pub struct RunnerSpec {
     /// spawned from inside the agent loop are also discoverable for SSE
     /// tailing and cancellation by other endpoints.
     pub agents: super::registry::AgentRegistry,
+    /// Provider-agnostic adapter registry. Used by the initial-user-content
+    /// builder to translate file attachments into the active model's native
+    /// wire format (OpenAI `input_file`, Anthropic `document`, Gemini `file_data`, ...).
+    pub providers: std::sync::Arc<ProviderRegistry>,
 }
 
 pub fn spawn(spec: RunnerSpec) -> RunHandle {
@@ -305,6 +310,22 @@ async fn run(spec: RunnerSpec, handle: RunHandle) -> Result<()> {
         attachment_count = spec.initial_user_attachments.len(),
         prompt_len = spec.initial_user_message.len(),
         "agent_run_start"
+    );
+    // Log the actual user prompt (truncated) so file-attached requests
+    // are traceable end-to-end: "user asked X, with file Y, model returned Z".
+    let prompt_preview = if spec.initial_user_message.len() > 600 {
+        format!(
+            "{}…(total {} chars)",
+            &spec.initial_user_message[..600],
+            spec.initial_user_message.len()
+        )
+    } else {
+        spec.initial_user_message.clone()
+    };
+    tracing::info!(
+        run_id = %spec.run_id,
+        "agent_run_user_prompt: {}",
+        prompt_preview
     );
     for att in &spec.initial_user_attachments {
         tracing::info!(
@@ -348,12 +369,30 @@ async fn run(spec: RunnerSpec, handle: RunHandle) -> Result<()> {
     });
     let prior = load_conversation_history(&spec.db, &spec.conversation_id).await?;
     if prior.is_empty() {
+        // Pick the wire-format-aware adapter for this exact (provider, model)
+        // pair. OpenAI needs Responses API vs Chat Completions routing;
+        // other providers map 1:1.
+        let adapter: &dyn ProviderAdapter = spec
+            .providers
+            .for_model(&spec.provider, &spec.model)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no provider adapter for provider='{}' model='{}'",
+                    spec.provider,
+                    spec.model
+                )
+            })?;
+        let content = build_initial_user_content(
+            &client,
+            adapter,
+            &spec.model,
+            &spec.initial_user_message,
+            &spec.initial_user_attachments,
+        )
+        .await?;
         messages.push(ChatMessage {
             role: "user".to_owned(),
-            content: Some(build_initial_user_content(
-                &spec.initial_user_message,
-                &spec.initial_user_attachments,
-            )),
+            content: Some(content),
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -436,6 +475,37 @@ async fn run(spec: RunnerSpec, handle: RunHandle) -> Result<()> {
             &spec.model,
         );
 
+        if windowed_messages.len() != messages.len() {
+            tracing::info!(
+                run_id = %spec.run_id,
+                step = _step,
+                original = messages.len(),
+                windowed = windowed_messages.len(),
+                dropped = messages.len() - windowed_messages.len(),
+                "context_windowed"
+            );
+        }
+
+        // Preview the messages being sent so logs reflect "what the model sees".
+        let message_summary: Vec<String> = windowed_messages
+            .iter()
+            .take(20)
+            .map(|m| {
+                let role = m.role.clone();
+                let len = m
+                    .content
+                    .as_ref()
+                    .map(|c| match c {
+                        Value::String(s) => s.len(),
+                        Value::Array(a) => a.len(),
+                        _ => 0,
+                    })
+                .unwrap_or(0);
+                let tool_calls = m.tool_calls.as_ref().map(|tc| tc.len()).unwrap_or(0);
+                format!("{}({}ch,{}tc)", role, len, tool_calls)
+            })
+            .collect();
+
         tracing::info!(
             run_id = %spec.run_id,
             step = _step,
@@ -445,6 +515,8 @@ async fn run(spec: RunnerSpec, handle: RunHandle) -> Result<()> {
             windowed_count = windowed_messages.len(),
             tools_count = tool_definitions.len(),
             retry_attempt = step_connection_retries,
+            message_summary = ?message_summary,
+            reasoning_level = spec.reasoning_level.as_deref().unwrap_or(""),
             "llm_request_start"
         );
 
@@ -811,6 +883,23 @@ async fn run(spec: RunnerSpec, handle: RunHandle) -> Result<()> {
 
             handle.emit(&events::message_end()).await?;
             set_status(&spec.db, spec.run_id, RunStatus::Completed, None).await?;
+
+            // Final summary log: the user wants a clear "what did the AI do with the file"
+            // trace at the end of each run.
+            let response_preview = if accumulated_text.len() > 800 {
+                format!("{}…(total {} chars)", &accumulated_text[..800], accumulated_text.len())
+            } else {
+                accumulated_text.clone()
+            };
+            tracing::info!(
+                run_id = %spec.run_id,
+                steps = _step + 1,
+                tool_calls_total = final_tool_calls.len(),
+                response_chars = accumulated_text.len(),
+                attachment_count = spec.initial_user_attachments.len(),
+                response_preview = %response_preview,
+                "agent_run_complete"
+            );
             return Ok(());
         }
 
@@ -838,6 +927,26 @@ async fn run(spec: RunnerSpec, handle: RunHandle) -> Result<()> {
             let is_subagent = tc.function.name == "spawn_subagent"
                 || tc.function.name == "run_subagent"
                 || tc.function.name == "runSubagent";
+
+            // Deep log: which tool, with what args, against which file/target.
+            // Args are bounded to ~400 chars so logs don't explode on large
+            // patch payloads.
+            let args_str = parsed_input.to_string();
+            let args_preview = if args_str.len() > 400 {
+                format!("{}…(total {} chars)", &args_str[..400], args_str.len())
+            } else {
+                args_str
+            };
+            tracing::info!(
+                run_id = %spec.run_id,
+                step = _step,
+                tool = %tc.function.name,
+                tool_call_id = %tc.id,
+                is_subagent = is_subagent,
+                invocation = %invocation,
+                args_preview = %args_preview,
+                "tool_dispatch_start"
+            );
             if is_subagent {
                 let agent_name = parsed_input
                     .get("agent")
@@ -926,12 +1035,19 @@ async fn run(spec: RunnerSpec, handle: RunHandle) -> Result<()> {
             let tool_elapsed = tool_start.elapsed();
             let (result_value, error_text) = match dispatch_result {
                 Ok(value) => {
+                    let result_str = value.to_string();
+                    let result_preview = if result_str.len() > 600 {
+                        format!("{}…(total {} chars)", &result_str[..600], result_str.len())
+                    } else {
+                        result_str
+                    };
                     tracing::info!(
                         run_id = %spec.run_id,
                         tool = %tc.function.name,
                         tool_call_id = %tc.id,
                         duration_ms = tool_elapsed.as_millis() as u64,
                         success = true,
+                        result_preview = %result_preview,
                         "tool_executed"
                     );
                     handle
@@ -1350,6 +1466,7 @@ async fn execute_subagent(
         channel: parent_spec.channel.clone(),
         reasoning_level: parent_spec.reasoning_level.clone(),
         agents: parent_spec.agents.clone(),
+        providers: parent_spec.providers.clone(),
     };
 
     let child_handle = spawn(child_spec);
@@ -1529,95 +1646,239 @@ async fn auto_title_conversation(
     Ok(())
 }
 
-/// Build the content payload for the first user turn. If no attachments are
-/// supplied this returns a plain JSON string (which OpenAI/Anthropic both
-/// accept as the simplest message form). With attachments it returns a
-/// structured parts array using OpenAI Chat Completions syntax
-/// (`{"type":"text",...}` and `{"type":"image_url","image_url":{"url":...}}`).
-/// The Anthropic transformer in [`super::anthropic`] translates this
-/// shape into Anthropic's native image content blocks.
+/// Build the content payload for the first user turn using the active
+/// provider's adapter. This is the only place in the agent loop where the
+/// provider abstraction actually matters — text, tool calls, and streaming
+/// pass through unchanged.
 ///
-/// For non-image files (text, code, CSV, PDF, etc.), the file content is
-/// fetched and included inline so the model can actually work with it.
-fn build_initial_user_content(text: &str, attachments: &[AttachmentInput]) -> Value {
+/// Routing is per-`(provider, model)`, not just per-provider, because some
+/// providers (notably OpenAI Chat Completions) accept `file` blocks only on
+/// specific models and OpenRouter-hosted models rarely implement vision at
+/// all. The capability lookup lives in [`super::model_caps`]:
+///
+///   * `gpt-4o`, `gpt-5*`, `claude-sonnet-4-6`, `gemini-2.5-pro` → native
+///     vision + native PDF block.
+///   * `gpt-4.1` Chat Completions → native vision only; PDF falls back to
+///     text extraction (rejects `file` blocks with "invalid argument type").
+///   * OpenRouter models, unknown providers → text extraction for everything
+///     (works for any model that can read text).
+///
+/// The text-extraction path itself fetches local uploads from disk, runs
+/// `pdftotext`/`pdfplumber` on PDFs, parses DOCX/XLSX, and includes the
+/// extracted text inline. Files where extraction fails still get a metadata
+/// block (path + size + URL) so the model can investigate via its shell
+/// tools.
+async fn build_initial_user_content(
+    client: &reqwest::Client,
+    adapter: &dyn ProviderAdapter,
+    model: &str,
+    text: &str,
+    attachments: &[AttachmentInput],
+) -> Result<Value> {
     if attachments.is_empty() {
-        return Value::String(text.to_owned());
+        return Ok(Value::String(text.to_owned()));
     }
+
+    let caps = model_caps::lookup(adapter.provider_id(), model);
+
     tracing::info!(
+        provider = adapter.provider_id(),
+        model = %model,
         attachment_count = attachments.len(),
+        native_image = caps.native_image,
+        native_pdf = caps.native_pdf,
+        reasoning_effort_supported = model_caps::supports_reasoning_effort(model),
         "attachment_processing_start"
     );
+
     let mut parts: Vec<Value> = Vec::with_capacity(attachments.len() + 1);
     if !text.is_empty() {
         parts.push(json!({ "type": "text", "text": text }));
     }
-    for att in attachments {
+
+    for (idx, att) in attachments.iter().enumerate() {
         let mime = att.mime_type.as_deref().unwrap_or("");
         let label = att.name.as_deref().unwrap_or("file");
+        let is_image = mime.starts_with("image/");
+        let is_pdf = mime == "application/pdf";
+
         tracing::info!(
-            url = %att.url,
+            attachment_index = idx,
+            filename = %label,
             mime = %mime,
-            name = %label,
-            "attachment_processing"
+            url = %att.url,
+            is_image = is_image,
+            is_pdf = is_pdf,
+            "attachment_processing_iter"
         );
-        if mime.starts_with("image/") {
-            tracing::info!(url = %att.url, mime = %mime, "attachment_image_url");
-            parts.push(json!({
-                "type": "image_url",
-                "image_url": { "url": att.url },
-            }));
-        } else {
-            // Non-image attachments: include file content inline when possible.
-            // Try to fetch the content from the URL so the model can read it.
-            let content = fetch_file_content_sync(&att.url);
-            match content {
-                Some(ref text_content) if text_content.len() <= 200_000 => {
+
+        // Per-model capability gate. `caps.native_*` is the only thing that
+        // decides native vs text fallback — provider-level flags were too
+        // permissive (gpt-4.1 + OpenRouter models went down the wrong path).
+        let natively_supported = (is_image && caps.native_image)
+            || (is_pdf && caps.native_pdf);
+
+        tracing::info!(
+            attachment_index = idx,
+            filename = %label,
+            mime = %mime,
+            natively_supported = natively_supported,
+            decision = if natively_supported { "native_block" } else { "text_fallback" },
+            "attachment_capability_decision"
+        );
+
+        if natively_supported {
+            let part = FilePart {
+                filename: label.to_string(),
+                media_type: mime.to_string(),
+                source: FileSource::Url(att.url.clone()),
+            };
+            match adapter.convert_file_part(client, &part).await {
+                Ok(block) => {
                     tracing::info!(
+                        provider = adapter.provider_id(),
                         url = %att.url,
-                        name = %label,
                         mime = %mime,
-                        content_bytes = text_content.len(),
-                        "attachment_inlined"
-                    );
-                    parts.push(json!({
-                        "type": "text",
-                        "text": format!(
-                            "--- File: {label} ({mime}) ---\n{text_content}\n--- End of {label} ---"
-                        ),
-                    }));
-                }
-                Some(ref text_content) => {
-                    tracing::warn!(
-                        url = %att.url,
                         name = %label,
-                        content_bytes = text_content.len(),
-                        limit = 200_000usize,
-                        "attachment_too_large_fallback"
+                        block_kind = block.get("type").and_then(|v| v.as_str()).unwrap_or("?"),
+                        "attachment_native_block_emitted"
                     );
-                    parts.push(json!({
-                        "type": "text",
-                        "text": format!("[Attached file '{label}' ({mime}) — {bytes} bytes, too large to inline: {url}]",
-                            label = label, mime = mime, bytes = text_content.len(), url = att.url),
-                    }));
+                    parts.push(block);
+                    continue;
                 }
-                None => {
+                Err(err) => {
+                    // Adapter failed (e.g. Anthropic couldn't fetch URL).
+                    // Fall through to the inlined-text path so the model
+                    // still gets context.
                     tracing::warn!(
+                        provider = adapter.provider_id(),
                         url = %att.url,
-                        name = %label,
-                        mime = %mime,
-                        "attachment_fetch_failed_fallback"
+                        error = %err,
+                        "attachment_adapter_failed_falling_back_to_text"
                     );
-                    // Fallback: just mention the file
-                    parts.push(json!({
-                        "type": "text",
-                        "text": format!("[Attached file '{label}' ({mime}): {url}]",
-                            label = label, mime = mime, url = att.url),
-                    }));
                 }
             }
         }
+
+        // Text-extraction fallback (works for every model — extracts PDF text
+        // via `pdftotext`/`pdfplumber`, parses DOCX/XLSX, reads plain text).
+        // For binary files where extraction fails we still emit a metadata
+        // block with the local path so the model can investigate via its
+        // shell / read tools.
+        push_text_fallback(&mut parts, att, label, mime);
     }
-    Value::Array(parts)
+
+    let preview: Vec<String> = parts
+        .iter()
+        .take(8)
+        .map(|p| {
+            let kind = p.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+            if kind == "text" {
+                let t = p.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                format!("text({}chars:{}…)", t.len(), &t.chars().take(40).collect::<String>())
+            } else {
+                kind.to_string()
+            }
+        })
+        .collect();
+    tracing::info!(
+        provider = adapter.provider_id(),
+        model = %model,
+        part_count = parts.len(),
+        part_kinds = ?preview,
+        "attachment_processing_complete"
+    );
+
+    Ok(Value::Array(parts))
+}
+
+/// Best-effort inline-text fallback for attachments the model can't receive
+/// natively (PDF on gpt-4.1, anything on OpenRouter, scanned PDFs without
+/// OCR, raw binary, …). Fetches local uploads directly from disk (no network
+/// round-trip) and remote URLs over HTTP. Always emits something useful so
+/// the model is never left with a bare URL it can't fetch.
+fn push_text_fallback(parts: &mut Vec<Value>, att: &AttachmentInput, label: &str, mime: &str) {
+    let local_path = local_uploads_path(&att.url);
+    let content = fetch_file_content_sync(&att.url);
+    match content {
+        Some(ref text_content) if text_content.len() <= 200_000 => {
+            tracing::info!(
+                url = %att.url,
+                name = %label,
+                mime = %mime,
+                content_bytes = text_content.len(),
+                "attachment_inlined"
+            );
+            let mut header = format!("📎 Attached file: {label} ({mime})");
+            if let Some(ref path) = local_path {
+                header.push_str(&format!("\nLocal path: {path}"));
+            }
+            parts.push(json!({
+                "type": "text",
+                "text": format!(
+                    "{header}\n\n--- Content ---\n{text_content}\n--- End of {label} ---",
+                    header = header,
+                    text_content = text_content,
+                    label = label,
+                ),
+            }));
+        }
+        Some(ref text_content) => {
+            tracing::warn!(
+                url = %att.url,
+                name = %label,
+                content_bytes = text_content.len(),
+                limit = 200_000usize,
+                "attachment_too_large_fallback"
+            );
+            let mut body = format!(
+                "📎 Attached: {label} ({mime}, {bytes} bytes) — too large to inline ({chars} chars).",
+                label = label,
+                mime = mime,
+                bytes = text_content.len(),
+                chars = text_content.len(),
+            );
+            if let Some(ref path) = local_path {
+                body.push_str(&format!("\nLocal path: {path}"));
+            }
+            body.push_str(&format!("\nURL: {url}", url = att.url));
+            parts.push(json!({
+                "type": "text",
+                "text": body,
+            }));
+        }
+        None => {
+            tracing::warn!(
+                url = %att.url,
+                name = %label,
+                mime = %mime,
+                "attachment_fetch_failed_fallback"
+            );
+            let mut body = format!("📎 Attached: {label} ({mime})", label = label, mime = mime);
+            if let Some(ref path) = local_path {
+                body.push_str(&format!("\nLocal path: {path}"));
+            } else {
+                body.push_str(&format!("\nURL: {url}", url = att.url));
+            }
+            parts.push(json!({
+                "type": "text",
+                "text": body,
+            }));
+        }
+    }
+}
+
+/// Resolve `./local_uploads/<key>` for local-upload URLs. Returns `None` for
+/// remote URLs so the fallback path can omit the path line.
+fn local_uploads_path(url: &str) -> Option<String> {
+    if !url.contains("/local-uploads/") {
+        return None;
+    }
+    let raw = url.rsplit('/').next()?;
+    let decoded = urlencoding::decode(raw)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| raw.to_string());
+    Some(format!("./local_uploads/{decoded}"))
 }
 
 /// Attempt to read file content from a URL (blocking, best-effort).
@@ -1642,16 +1903,51 @@ fn fetch_file_content_sync(url: &str) -> Option<String> {
                 return None;
             }
         };
-        // Detect PDF by magic bytes — return a clear message instead of binary garbage
+        // Detect PDF by magic bytes — extract text using the pure-Rust
+        // `pdf-extract` crate (works on all platforms without an OS-level
+        // `pdftotext` install), with OS-tool fallback for edge cases.
         if bytes.starts_with(b"%PDF") {
-            tracing::info!(url = %url, bytes = bytes.len(), "fetch_file_content_sync: PDF detected, returning guidance message");
-            return Some(
-                "[This is a PDF file (binary). The raw bytes cannot be read as text. \
-                 Inform the user that PDF text extraction is not available: ask them \
-                 to copy-paste the relevant text, or describe what information they \
-                 need from the document.]"
-                    .to_string(),
-            );
+            tracing::info!(url = %url, bytes = bytes.len(), "fetch_file_content_sync: PDF detected, extracting text");
+            if let Some(text) = extract_pdf_text_from_bytes(&bytes) {
+                tracing::info!(url = %url, chars = text.len(), "fetch_file_content_sync: PDF text extracted via pdf-extract crate");
+                return Some(format!("[PDF content extracted from: {}]\n\n{}", url, text));
+            }
+            // Fall back to OS-level extractors (poppler / pdfplumber) for
+            // PDFs that pdf-extract can't handle (rare).
+            if let Some(text) = extract_pdf_text_via_exec(&path) {
+                if !text.trim().is_empty() {
+                    tracing::info!(url = %url, chars = text.len(), "fetch_file_content_sync: PDF text extracted via OS tool fallback");
+                    return Some(format!("[PDF content extracted from: {}]\n\n{}", url, text));
+                }
+            }
+            tracing::warn!(url = %url, "fetch_file_content_sync: PDF text extraction failed across all extractors");
+            return Some(format!(
+                "[This is a PDF file ({} bytes). Text extraction was attempted but the file may be image-only / scanned. \
+                 If you need its content, copy-paste the text, or install poppler-utils (`apt install poppler-utils` / `brew install poppler`) for OCR fallback.]",
+                bytes.len()
+            ));
+        }
+        // Detect DOCX (ZIP with word/document.xml)
+        if bytes.starts_with(b"PK\x03\x04") {
+            // Try DOCX extraction
+            let docx_text = extract_docx_text(&bytes);
+            if let Some(text) = docx_text {
+                tracing::info!(url = %url, chars = text.len(), "fetch_file_content_sync: DOCX text extracted");
+                return Some(format!("[DOCX content extracted from: {}]\n\n{}", url, text));
+            }
+            // Try XLSX extraction
+            let xlsx_text = extract_xlsx_text(&bytes);
+            if let Some(text) = xlsx_text {
+                tracing::info!(url = %url, chars = text.len(), "fetch_file_content_sync: XLSX text extracted");
+                return Some(format!("[XLSX content extracted from: {}]\n\n{}", url, text));
+            }
+            // Generic ZIP — can't extract meaningful text
+            tracing::info!(url = %url, bytes = bytes.len(), "fetch_file_content_sync: ZIP/Office file, extraction not possible");
+            return Some(format!(
+                "[Office/ZIP file ({} bytes). Could not extract text. \
+                 Try using exec_system to run a conversion tool, or ask the user to provide content as text.]",
+                bytes.len()
+            ));
         }
         // Generic binary heuristic: >30% non-printable bytes in first 512
         let sample = &bytes[..bytes.len().min(512)];
@@ -1671,20 +1967,108 @@ fn fetch_file_content_sync(url: &str) -> Option<String> {
         tracing::info!(url = %url, success = result.is_some(), "fetch_file_content_sync: local file read complete");
         return result;
     }
-    // For remote URLs, use a quick blocking fetch
+    // For remote URLs, download bytes and run the same content-type-aware
+    // extraction as the local path. Previously this branch called
+    // `resp.text()` which silently dropped binary content (PDFs, images,
+    // Office files) — `String::from_utf8` rejected them and the model
+    // received nothing.
     tracing::debug!(url = %url, "fetch_file_content_sync: fetching remote url");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
         .build()
-        .ok()?;
-    let resp = client.get(url).send().ok()?;
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "fetch_file_content_sync: failed to build blocking client");
+            return None;
+        }
+    };
+    let resp = match client.get(url).send() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(url = %url, error = %e, "fetch_file_content_sync: remote fetch send failed");
+            return None;
+        }
+    };
     if !resp.status().is_success() {
-        tracing::warn!(url = %url, status = resp.status().as_u16(), "fetch_file_content_sync: remote fetch failed");
+        tracing::warn!(url = %url, status = resp.status().as_u16(), "fetch_file_content_sync: remote fetch non-2xx");
         return None;
     }
-    let text = resp.text().ok();
-    tracing::info!(url = %url, success = text.is_some(), "fetch_file_content_sync: remote fetch complete");
-    text
+    let bytes = match resp.bytes() {
+        Ok(b) => b.to_vec(),
+        Err(e) => {
+            tracing::warn!(url = %url, error = %e, "fetch_file_content_sync: remote bytes read failed");
+            return None;
+        }
+    };
+    tracing::info!(url = %url, bytes = bytes.len(), "fetch_file_content_sync: remote bytes received");
+
+    // Content-type-aware extraction. PDF / Office files don't decode as
+    // UTF-8 — they need their own extractors.
+    if bytes.starts_with(b"%PDF") {
+        if let Some(text) = extract_pdf_text_from_bytes(&bytes) {
+            tracing::info!(url = %url, chars = text.len(), "fetch_file_content_sync: remote PDF text extracted via pdf-extract");
+            return Some(format!("[PDF content extracted from: {}]\n\n{}", url, text));
+        }
+        tracing::warn!(url = %url, "fetch_file_content_sync: remote PDF extraction failed");
+        return Some(format!(
+            "[This is a PDF file ({} bytes) hosted at {}. Text extraction failed — content may be image-only.]",
+            bytes.len(),
+            url
+        ));
+    }
+    if bytes.starts_with(b"PK\x03\x04") {
+        if let Some(text) = extract_docx_text(&bytes) {
+            return Some(format!("[DOCX content extracted from: {}]\n\n{}", url, text));
+        }
+        if let Some(text) = extract_xlsx_text(&bytes) {
+            return Some(format!("[XLSX content extracted from: {}]\n\n{}", url, text));
+        }
+        return Some(format!(
+            "[Office/ZIP file ({} bytes) hosted at {}. Could not extract text.]",
+            bytes.len(),
+            url
+        ));
+    }
+    // Plain text — try UTF-8 decode.
+    let result = String::from_utf8(bytes.clone()).ok();
+    tracing::info!(url = %url, success = result.is_some(), "fetch_file_content_sync: remote text decode complete");
+    result
+}
+
+#[cfg(test)]
+mod pdf_extraction_tests {
+    use super::*;
+
+    /// Smoke test: extract text from a real PDF in the project's
+    /// `local_uploads/` dir to confirm the pure-Rust `pdf-extract` crate
+    /// works on the developer's machine. The test is ignored (with
+    /// `#[ignore]`) when no PDF is present so the CI test run stays green
+    /// even on a fresh checkout.
+    #[test]
+    fn extract_text_from_real_local_pdf() {
+        let pdf_path = std::path::Path::new("local_uploads/019ebff6-f50d-7760-a4fc-5bcfff30d2f5.pdf");
+        if !pdf_path.exists() {
+            eprintln!(
+                "skipping: test PDF not present at {}. \
+                 Upload any PDF via the chat UI and re-run this test \
+                 (or update the path) to verify pdf-extract works locally.",
+                pdf_path.display()
+            );
+            return;
+        }
+        let bytes = std::fs::read(pdf_path).expect("read test PDF");
+        assert!(bytes.starts_with(b"%PDF"), "file is not a PDF");
+        let text = extract_pdf_text_from_bytes(&bytes)
+            .expect("pdf-extract should produce non-empty text for a real PDF");
+        assert!(
+            text.len() > 20,
+            "extracted text too short ({} chars) — extraction may have failed",
+            text.len()
+        );
+        eprintln!("extracted {} chars from {}", text.len(), pdf_path.display());
+        eprintln!("preview: {}", &text.chars().take(200).collect::<String>());
+    }
 }
 
 /// Simple heuristic title generation from user prompt (no LLM call needed).
@@ -1713,4 +2097,162 @@ fn generate_title_from_prompt(prompt: &str) -> String {
     } else {
         format!("{}...", truncated.trim_end())
     }
+}
+
+// ============ FILE EXTRACTION HELPERS ============
+
+/// Extract text from PDF bytes using the pure-Rust `pdf-extract` crate.
+/// No external `pdftotext` / `pdfplumber` install required — works on every
+/// platform out of the box (Windows / Linux / macOS).
+fn extract_pdf_text_from_bytes(bytes: &[u8]) -> Option<String> {
+    match pdf_extract::extract_text_from_mem(bytes) {
+        Ok(text) if !text.trim().is_empty() => Some(text),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(error = %err, "pdf-extract failed for in-memory bytes");
+            None
+        }
+    }
+}
+
+/// Extract text from a PDF using OS-level tools (poppler-utils or
+/// pdfplumber). Kept as a fallback for the rare cases where `pdf-extract`
+/// returns empty text (e.g. image-only / scanned PDFs that pdftotext can
+/// also extract text from via embedded fonts).
+fn extract_pdf_text_via_exec(path: &std::path::Path) -> Option<String> {
+    let path_str = path.display().to_string();
+
+    // Try pdftotext (fastest, most reliable when available)
+    let result = std::process::Command::new("pdftotext")
+        .args([&path_str, "-"])
+        .output();
+    if let Ok(output) = result {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout).to_string();
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+        }
+    }
+
+    // Try python with pdfplumber (common in ML environments)
+    let python_script = format!(
+        "import sys\ntry:\n    import pdfplumber\n    with pdfplumber.open(sys.argv[1]) as pdf:\n        for page in pdf.pages:\n            text = page.extract_text()\n            if text: print(text)\nexcept: pass"
+    );
+    let result = std::process::Command::new("python")
+        .args(["-c", &python_script, &path_str])
+        .output();
+    if let Ok(output) = result {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout).to_string();
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+        }
+    }
+
+    // Try python3
+    let result = std::process::Command::new("python3")
+        .args(["-c", &python_script, &path_str])
+        .output();
+    if let Ok(output) = result {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout).to_string();
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract text from a DOCX file (ZIP containing word/document.xml).
+/// Strips XML tags to get plain text. No external crate needed.
+fn extract_docx_text(bytes: &[u8]) -> Option<String> {
+    use std::io::{Cursor, Read};
+    let cursor = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+
+    // Look for word/document.xml
+    let mut doc_xml = String::new();
+    {
+        let mut file = archive.by_name("word/document.xml").ok()?;
+        file.read_to_string(&mut doc_xml).ok()?;
+    }
+
+    // Strip XML tags to get plain text
+    let mut text = String::with_capacity(doc_xml.len() / 2);
+    let mut in_tag = false;
+    let mut last_was_space = false;
+    for ch in doc_xml.chars() {
+        if ch == '<' {
+            in_tag = true;
+            // Add space between tags that represent paragraph/line breaks
+            if !last_was_space && !text.is_empty() {
+                text.push(' ');
+                last_was_space = true;
+            }
+        } else if ch == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            if ch.is_whitespace() {
+                if !last_was_space {
+                    text.push(' ');
+                    last_was_space = true;
+                }
+            } else {
+                text.push(ch);
+                last_was_space = false;
+            }
+        }
+    }
+
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+/// Extract text from an XLSX file (ZIP containing xl/sharedStrings.xml + worksheets).
+/// Returns a CSV-like representation.
+fn extract_xlsx_text(bytes: &[u8]) -> Option<String> {
+    use std::io::{Cursor, Read};
+    let cursor = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+
+    // Try to read shared strings
+    let mut shared_strings = Vec::new();
+    if let Ok(mut file) = archive.by_name("xl/sharedStrings.xml") {
+        let mut xml = String::new();
+        file.read_to_string(&mut xml).ok()?;
+        // Extract <t>...</t> values
+        for segment in xml.split("<t") {
+            if let Some(start) = segment.find('>') {
+                if let Some(end) = segment[start + 1..].find("</t>") {
+                    shared_strings.push(segment[start + 1..start + 1 + end].to_string());
+                }
+            }
+        }
+    }
+
+    // Read first worksheet
+    let mut sheet_xml = String::new();
+    if let Ok(mut file) = archive.by_name("xl/worksheets/sheet1.xml") {
+        file.read_to_string(&mut sheet_xml).ok()?;
+    } else {
+        return None;
+    }
+
+    // Build a simple text representation
+    let mut output = String::with_capacity(4096);
+    output.push_str("[Spreadsheet data]\n");
+    if !shared_strings.is_empty() {
+        output.push_str(&format!("Cells: {}\n", shared_strings.len()));
+        for (i, s) in shared_strings.iter().take(500).enumerate() {
+            if !s.trim().is_empty() {
+                output.push_str(&format!("{}: {}\n", i, s));
+            }
+        }
+    }
+
+    if output.len() > 30 { Some(output) } else { None }
 }

@@ -226,6 +226,7 @@ pub async fn create_run(
         channel: channel.to_owned(),
         reasoning_level: payload.reasoning_level.clone(),
         agents: state.agents.clone(),
+        providers: state.providers.clone(),
     });
     state.agents.insert(handle);
 

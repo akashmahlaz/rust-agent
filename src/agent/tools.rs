@@ -1720,21 +1720,113 @@ async fn create_file(ws: &Workspace, input: &Value) -> Result<Value> {
         .filter(|name| !name.is_empty())
         .unwrap_or("download");
     let download_id = Uuid::now_v7();
-    let download_dir = PathBuf::from("./local_uploads")
-        .join("generated")
-        .join(download_id.to_string());
-    tokio::fs::create_dir_all(&download_dir).await?;
-    let served_path = download_dir.join(filename);
-    tokio::fs::copy(&path, &served_path).await?;
     let encoded_filename = urlencoding::encode(filename);
 
-    Ok(json!({
-        "path": args.path,
-        "description": args.description,
-        "size_bytes": size,
-        "download_url": format!("/local-uploads/generated/{download_id}/{encoded_filename}"),
-        "status": "ready",
-    }))
+    // Detect MIME type from extension
+    let mime = mime_guess::from_path(&path)
+        .first_or_octet_stream()
+        .to_string();
+
+    // Try S3 upload first (persistent, works in production)
+    let has_s3 = std::env::var("AWS_REGION").ok().filter(|v| !v.is_empty()).is_some()
+        && std::env::var("AWS_BUCKET_NAME").ok().filter(|v| !v.is_empty()).is_some()
+        && std::env::var("AWS_ACCESS_KEY").ok().filter(|v| !v.is_empty()).is_some()
+        && std::env::var("AWS_SECRET_KEY").ok().filter(|v| !v.is_empty()).is_some();
+
+    if has_s3 {
+        let region = std::env::var("AWS_REGION").unwrap();
+        let bucket = std::env::var("AWS_BUCKET_NAME").unwrap();
+        let access_key = std::env::var("AWS_ACCESS_KEY").unwrap();
+        let secret_key = std::env::var("AWS_SECRET_KEY").unwrap();
+
+        let s3_key = format!("generated/{download_id}/{encoded_filename}");
+        let file_bytes = tokio::fs::read(&path).await?;
+
+        let creds = aws_sdk_s3::config::Credentials::new(
+            &access_key, &secret_key, None, None, "env",
+        );
+        let s3_config = aws_sdk_s3::Config::builder()
+            .region(aws_sdk_s3::config::Region::new(region.clone()))
+            .credentials_provider(creds)
+            .behavior_version_latest()
+            .build();
+        let client = aws_sdk_s3::Client::from_conf(s3_config);
+
+        tracing::info!(
+            s3_key = %s3_key,
+            bucket = %bucket,
+            size_bytes = size,
+            mime = %mime,
+            "create_file: uploading to S3"
+        );
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(&s3_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(file_bytes))
+            .content_type(&mime)
+            .content_disposition(format!(
+                "attachment; filename=\"{}\"",
+                filename.replace('"', "'")
+            ))
+            .send()
+            .await
+            .map_err(|e| anyhow!("S3 upload failed: {e}"))?;
+
+        let public_url = format!(
+            "https://{bucket}.s3.{region}.amazonaws.com/{s3_key}"
+        );
+
+        tracing::info!(
+            url = %public_url,
+            filename = %filename,
+            "create_file: S3 upload complete"
+        );
+
+        Ok(json!({
+            "path": args.path,
+            "filename": filename,
+            "description": args.description,
+            "size_bytes": size,
+            "mime_type": mime,
+            "download_url": public_url,
+            "storage": "s3",
+            "status": "ready",
+        }))
+    } else {
+        // Fallback: local disk (dev mode)
+        let download_dir = PathBuf::from("./local_uploads")
+            .join("generated")
+            .join(download_id.to_string());
+        tokio::fs::create_dir_all(&download_dir).await?;
+        let served_path = download_dir.join(filename);
+        tokio::fs::copy(&path, &served_path).await?;
+
+        let public_base = std::env::var("OPERON_PUBLIC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned());
+        let public_url = format!(
+            "{}/local-uploads/generated/{download_id}/{encoded_filename}",
+            public_base.trim_end_matches('/')
+        );
+
+        tracing::info!(
+            url = %public_url,
+            filename = %filename,
+            "create_file: saved to local disk"
+        );
+
+        Ok(json!({
+            "path": args.path,
+            "filename": filename,
+            "description": args.description,
+            "size_bytes": size,
+            "mime_type": mime,
+            "download_url": public_url,
+            "storage": "local",
+            "status": "ready",
+        }))
+    }
 }
 
 // ============ SYSTEM-WIDE FILE TOOLS ============
@@ -2381,6 +2473,7 @@ pub struct BackgroundTasks {
     tasks: RwLock<HashMap<String, BackgroundTaskHandle>>,
 }
 
+#[allow(dead_code)]
 pub struct BackgroundTaskHandle {
     pub id: String,
     pub name: String,

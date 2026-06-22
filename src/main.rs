@@ -13,7 +13,12 @@ use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{agent::AgentRegistry, codex::CodexBridge, config::Config, state::AppState};
+use crate::{
+    agent::{AgentRegistry, ProviderRegistry},
+    codex::CodexBridge,
+    config::Config,
+    state::AppState,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,6 +33,7 @@ async fn main() -> Result<()> {
         agents: AgentRegistry::new(),
         config: config.clone(),
         db: pool,
+        providers: std::sync::Arc::new(ProviderRegistry::with_defaults()),
     };
 
     let app = http::router(state).layer(TraceLayer::new_for_http());

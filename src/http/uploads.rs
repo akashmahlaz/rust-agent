@@ -160,17 +160,24 @@ pub async fn create_upload(
     tracing::info!(has_s3 = has_s3, filename = %original_filename, size_bytes = size, "upload: deciding storage path");
 
     if has_s3 {
-        tracing::info!("upload: using S3 storage");
-        upload_to_s3(&state, &key, &original_filename, &content_type, bytes, size, user_id, conversation_id).await
-    } else {
-        tracing::warn!(
-            "upload: AWS credentials not configured \
-             (AWS_REGION / AWS_BUCKET_NAME / AWS_ACCESS_KEY / AWS_SECRET_KEY). \
-             Falling back to local disk storage at {LOCAL_UPLOADS_DIR}. \
-             Files will NOT persist across server restarts in production."
-        );
-        upload_to_local(&state, &key, &original_filename, &content_type, bytes, size, user_id, conversation_id).await
+        tracing::info!("upload: attempting S3 storage");
+        match upload_to_s3(&state, &key, &original_filename, &content_type, bytes.clone(), size, user_id, conversation_id).await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                tracing::error!(error = %e, "upload: S3 upload FAILED, falling back to local disk");
+                // Fall through to local upload
+            }
+        }
     }
+
+    // Local disk fallback (dev mode or S3 failure)
+    if !has_s3 {
+        tracing::warn!(
+            "upload: AWS credentials not configured. \
+             Falling back to local disk storage at {LOCAL_UPLOADS_DIR}."
+        );
+    }
+    upload_to_local(&state, &key, &original_filename, &content_type, bytes, size, user_id, conversation_id).await
 }
 
 // ---------------------------------------------------------------------------

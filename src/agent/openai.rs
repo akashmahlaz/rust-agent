@@ -14,6 +14,8 @@ use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::model_caps;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -248,7 +250,18 @@ pub async fn stream_chat(
         body["tool_choice"] = serde_json::json!("auto");
     }
     if let Some(effort) = openai_reasoning_effort(reasoning_level) {
-        body["reasoning_effort"] = serde_json::json!(effort);
+        // Gate by model: gpt-4o / gpt-4.1 / gpt-3.5 reject this field with
+        // 400 "Unrecognized request argument supplied: reasoning_effort".
+        // Only o-series, gpt-5*, codex* accept it.
+        if model_caps::supports_reasoning_effort(model) {
+            body["reasoning_effort"] = serde_json::json!(effort);
+        } else {
+            tracing::debug!(
+                model = %model,
+                level = %reasoning_level.unwrap_or(""),
+                "reasoning_effort not supported by model — omitting"
+            );
+        }
     }
 
     let (response, retries) =
@@ -300,10 +313,22 @@ pub async fn stream_responses(
         body["parallel_tool_calls"] = serde_json::json!(true);
     }
     if let Some(effort) = openai_reasoning_effort(reasoning_level) {
-        // `summary: "auto"` is REQUIRED to receive
-        // `response.reasoning_summary_text.delta` SSE events.
-        // Without it, gpt-5/o-series do reasoning silently and emit no delta.
-        body["reasoning"] = serde_json::json!({ "effort": effort, "summary": "auto" });
+        // Gate by model. `stream_responses` is only routed to gpt-5*/codex*
+        // via `requires_responses_api`, so this is defensive — but matches
+        // the Chat Completions path and prevents future routing changes
+        // from regressing into a 400.
+        if model_caps::supports_reasoning_effort(model) {
+            // `summary: "auto"` is REQUIRED to receive
+            // `response.reasoning_summary_text.delta` SSE events.
+            // Without it, gpt-5/o-series do reasoning silently and emit no delta.
+            body["reasoning"] = serde_json::json!({ "effort": effort, "summary": "auto" });
+        } else {
+            tracing::debug!(
+                model = %model,
+                level = %reasoning_level.unwrap_or(""),
+                "reasoning_effort not supported by model — omitting"
+            );
+        }
     } else {
         // Even when no explicit effort is set, request reasoning summaries so
         // gpt-5 / o-series surface their thinking instead of staying silent.
