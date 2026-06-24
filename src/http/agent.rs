@@ -166,7 +166,23 @@ pub async fn create_run(
     .execute(&state.db)
     .await?;
 
-    // persist the initial user message
+    // persist the initial user message (including any file attachments so
+    // the conversation reload renders the same file chips as the live send).
+    let mut user_parts = vec![
+        json!({ "type": "text-delta", "text": prompt }),
+        json!({ "type": "text-end", "text": "" }),
+    ];
+    // Store attachment metadata as parts so the frontend can render them on reload
+    if let Some(ref attachments) = payload.attachments {
+        for att in attachments {
+            user_parts.push(json!({
+                "type": "file-attachment",
+                "url": att.url,
+                "mimeType": att.mime_type,
+                "name": att.name,
+            }));
+        }
+    }
     sqlx::query(
         "insert into messages (id, conversation_id, user_id, role, content, parts) values ($1, $2, $3, 'user', $4, $5)",
     )
@@ -174,7 +190,7 @@ pub async fn create_run(
     .bind(conversation_id)
     .bind(user_id)
     .bind(prompt)
-    .bind(json!([{ "type": "text-delta", "text": prompt }, { "type": "text-end", "text": "" }]))
+    .bind(json!(user_parts))
     .execute(&state.db)
     .await?;
 

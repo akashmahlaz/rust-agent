@@ -69,6 +69,20 @@ impl ProviderAdapter for GoogleAdapter {
                     }
                 }))
             }
+            FileSource::DataUrl(data) => {
+                // Extract base64 portion: `data:<mime>;base64,<b64>` → `<b64>`.
+                let b64 = if let Some(idx) = data.find("base64,") {
+                    data[idx + 7..].to_string()
+                } else {
+                    data.to_string()
+                };
+                Ok(json!({
+                    "inline_data": {
+                        "mime_type": media_type,
+                        "data": b64,
+                    }
+                }))
+            }
         }
     }
 

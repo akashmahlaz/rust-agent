@@ -41,6 +41,15 @@ impl ProviderAdapter for AnthropicAdapter {
     async fn convert_file_part(&self, client: &Client, part: &FilePart) -> Result<Value> {
         let media_type = part.media_type.as_str();
 
+        // Helper: extract the base64 portion from a `data:<mime>;base64,<b64>` URL.
+        let extract_b64 = |d: &str| -> String {
+            if let Some(idx) = d.find("base64,") {
+                d[idx + 7..].to_string()
+            } else {
+                d.to_string()
+            }
+        };
+
         // Images: Anthropic accepts URLs, so we pass them straight through.
         if is_image(media_type) {
             return match &part.source {
@@ -58,6 +67,14 @@ impl ProviderAdapter for AnthropicAdapter {
                         "type": "base64",
                         "media_type": media_type,
                         "data": base64,
+                    },
+                })),
+                FileSource::DataUrl(data) => Ok(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": extract_b64(data),
                     },
                 })),
             };
@@ -79,6 +96,14 @@ impl ProviderAdapter for AnthropicAdapter {
                         "type": "base64",
                         "media_type": media_type,
                         "data": base64,
+                    },
+                })),
+                FileSource::DataUrl(data) => Ok(json!({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": extract_b64(data),
                     },
                 })),
                 FileSource::Url(url) => {
@@ -109,6 +134,14 @@ impl ProviderAdapter for AnthropicAdapter {
                         "type": "base64",
                         "media_type": media_type,
                         "data": base64,
+                    },
+                })),
+                FileSource::DataUrl(data) => Ok(json!({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": extract_b64(data),
                     },
                 })),
                 FileSource::Url(url) => {

@@ -121,6 +121,17 @@ impl OpenAiAdapter {
                     }))
                 }
             }
+            FileSource::DataUrl(data) => {
+                if is_image(media_type) {
+                    Ok(json!({ "type": "input_image", "image_url": data }))
+                } else {
+                    Ok(json!({
+                        "type": "input_file",
+                        "filename": part.filename,
+                        "file_data": data,
+                    }))
+                }
+            }
         }
     }
 
@@ -180,6 +191,22 @@ impl OpenAiAdapter {
                         "file": {
                             "filename": part.filename,
                             "file_data": super::data_url(media_type, base64),
+                        },
+                    }))
+                }
+            }
+            FileSource::DataUrl(data) => {
+                if is_image(media_type) {
+                    Ok(json!({
+                        "type": "image_url",
+                        "image_url": { "url": data },
+                    }))
+                } else {
+                    Ok(json!({
+                        "type": "file",
+                        "file": {
+                            "filename": part.filename,
+                            "file_data": data,
                         },
                     }))
                 }

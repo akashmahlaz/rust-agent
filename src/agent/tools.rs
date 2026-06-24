@@ -106,6 +106,10 @@ pub struct AgentContext {
     pub channel: String,
     /// Authenticated user ID (from JWT).
     pub user_id: Uuid,
+    /// Conversation this run belongs to. Used by file-output tools
+    /// (e.g. `create_file`) to persist the generated file in the
+    /// `conversation_files` table so it shows up in the chat sidebar.
+    pub conversation_id: Uuid,
     /// Shared database pool (Postgres/SQLx). Used by integration tools to
     /// resolve credentials and persist data.
     pub db: Pool<Postgres>,
@@ -118,6 +122,7 @@ impl AgentContext {
         github_token: Option<String>,
         channel: String,
         user_id: Uuid,
+        conversation_id: Uuid,
         db: Pool<Postgres>,
     ) -> Self {
         Self {
@@ -126,6 +131,7 @@ impl AgentContext {
             github_token,
             channel,
             user_id,
+            conversation_id,
             db,
         }
     }
@@ -517,14 +523,16 @@ fn all_tool_definitions() -> Vec<Value> {
         ),
         tool_def(
             "create_file",
-            "Create a file in the workspace and return a download URL. Use this when the user asks you to generate a PDF, CSV, image, document, or any downloadable file. Write the file contents to workspace, then this tool makes it accessible via URL.",
+            "Generate a downloadable file for the user and return a public download URL. Use this for ANY file the user asks you to produce — PDFs, CSVs, images, documents, code files, spreadsheets, archives, etc. You can either (a) pass `contents` inline (text OR base64-encoded binary) and this tool will write the file AND expose a download URL in one call, or (b) leave `contents` empty and ensure the file already exists in the workspace (via write_file or exec). The returned `download_url` is shown to the user as a download button. ALWAYS call this tool — instead of just write_file — when the user wants to receive a file.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["path", "description"],
                 "properties": {
-                    "path": { "type": "string", "description": "Workspace-relative path for the output file (e.g. 'output/resume.pdf')." },
-                    "description": { "type": "string", "description": "Brief description of the file for the user." }
+                    "path": { "type": "string", "description": "Workspace-relative path including extension (e.g. 'output/report.pdf', 'output/data.csv', 'output/photo.png'). The extension determines the MIME type served to the user." },
+                    "description": { "type": "string", "description": "Brief description of the file for the user." },
+                    "contents": { "type": "string", "description": "Optional. File contents — UTF-8 text for text formats, or base64-encoded bytes for binary (PDF/PNG/JPG/ZIP). If omitted, the file at `path` must already exist in the workspace." },
+                    "encoding": { "type": "string", "enum": ["utf-8", "base64"], "description": "How to interpret `contents`. Defaults to 'utf-8'. Use 'base64' for binary files (PDF, images, archives)." }
                 }
             }),
         ),
@@ -898,7 +906,7 @@ pub async fn dispatch(ctx: &AgentContext, tool_name: &str, input: &Value) -> Res
         "exec" => exec(ws, input).await,
         "web_search" => web_search(ctx, input).await,
         "web_fetch" => web_fetch(ctx, input).await,
-        "create_file" => create_file(ws, input).await,
+        "create_file" => create_file(ctx, input).await,
         // System-wide tools (bypass workspace isolation)
         "read_system_file" => read_system_file(input).await,
         "write_system_file" => write_system_file(input).await,
@@ -1691,19 +1699,51 @@ async fn web_fetch(ctx: &AgentContext, input: &Value) -> Result<Value> {
     }))
 }
 
-async fn create_file(ws: &Workspace, input: &Value) -> Result<Value> {
+async fn create_file(ctx: &AgentContext, input: &Value) -> Result<Value> {
     #[derive(Deserialize)]
     struct Args {
         path: String,
         description: String,
+        /// Optional inline contents. When provided we write the file ourselves
+        /// so the AI can produce a downloadable file in a single tool call
+        /// (no need to call write_file first). For binary files (PDF, images,
+        /// archives) pass `encoding: "base64"` and base64-encoded bytes here.
+        contents: Option<String>,
+        encoding: Option<String>,
     }
     let args: Args = serde_json::from_value(input.clone())?;
+    let ws = &ctx.workspace;
     let path = ws.resolve(&args.path)?;
 
-    // Verify the file exists (agent should have written it with write_file or exec first)
-    if !path.exists() {
+    // Two paths:
+    //   (a) `contents` provided → write the file ourselves, then expose.
+    //   (b) `contents` omitted → file must already exist in the workspace.
+    if let Some(contents) = args.contents.as_deref() {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        let bytes = match args.encoding.as_deref() {
+            Some("base64") => {
+                use base64ct::{Base64, Encoding};
+                let cleaned: String = contents
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                Base64::decode_vec(&cleaned)
+                    .map_err(|e| anyhow!("contents is not valid base64: {e}"))?
+            }
+            _ => contents.as_bytes().to_vec(),
+        };
+        tokio::fs::write(&path, &bytes).await?;
+        tracing::info!(
+            path = %args.path,
+            size_bytes = bytes.len(),
+            encoding = args.encoding.as_deref().unwrap_or("utf-8"),
+            "create_file: wrote inline contents"
+        );
+    } else if !path.exists() {
         bail!(
-            "File '{}' does not exist. Write the file first using write_file or exec, then call create_file to generate the download URL.",
+            "File '{}' does not exist. Either pass `contents` inline or write the file first using write_file / exec, then call create_file to generate the download URL.",
             args.path
         );
     }
@@ -1784,6 +1824,9 @@ async fn create_file(ws: &Workspace, input: &Value) -> Result<Value> {
             "create_file: S3 upload complete"
         );
 
+        // Persist to conversation_files so it shows in the chat sidebar
+        persist_generated_file(ctx, filename, &s3_key, "s3", &mime, size, &public_url).await;
+
         Ok(json!({
             "path": args.path,
             "filename": filename,
@@ -1816,6 +1859,10 @@ async fn create_file(ws: &Workspace, input: &Value) -> Result<Value> {
             "create_file: saved to local disk"
         );
 
+        // Persist to conversation_files so it shows in the chat sidebar
+        let local_key = format!("generated/{download_id}/{encoded_filename}");
+        persist_generated_file(ctx, filename, &local_key, "local", &mime, size, &public_url).await;
+
         Ok(json!({
             "path": args.path,
             "filename": filename,
@@ -1826,6 +1873,41 @@ async fn create_file(ws: &Workspace, input: &Value) -> Result<Value> {
             "storage": "local",
             "status": "ready",
         }))
+    }
+}
+
+/// Best-effort persistence of a generated file to `conversation_files`.
+/// Non-fatal — if this fails the download URL is still returned to the user.
+async fn persist_generated_file(
+    ctx: &AgentContext,
+    filename: &str,
+    storage_key: &str,
+    storage_type: &str,
+    content_type: &str,
+    size: u64,
+    url: &str,
+) {
+    let file_id = Uuid::now_v7();
+    let result = sqlx::query(
+        r#"INSERT INTO conversation_files
+           (id, conversation_id, user_id, original_filename, storage_key, storage_type, content_type, size_bytes, url)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#
+    )
+    .bind(file_id)
+    .bind(ctx.conversation_id)
+    .bind(ctx.user_id)
+    .bind(filename)
+    .bind(storage_key)
+    .bind(storage_type)
+    .bind(content_type)
+    .bind(size as i64)
+    .bind(url)
+    .execute(&ctx.db)
+    .await;
+
+    match result {
+        Ok(_) => tracing::info!(file_id = %file_id, filename = %filename, "create_file: persisted to conversation_files"),
+        Err(e) => tracing::warn!(error = %e, filename = %filename, "create_file: failed to persist to conversation_files (non-fatal)"),
     }
 }
 

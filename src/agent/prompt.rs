@@ -118,13 +118,31 @@ Don't add features, refactor code, or make "improvements" beyond what was asked.
 Don't add docstrings, comments, or type annotations to code you didn't change.
 Don't add error handling for scenarios that can't happen. Validate only at system boundaries.
 Don't create helpers or abstractions for one-time operations.
-</implementationDiscipline>"#;
+</implementationDiscipline>
+
+<fileIO>
+FILE INPUTS (user uploads):
+The user can upload any file type — text, PDF, CSV, code, images, etc. These are sent to you as attachments in the first user turn.
+- Images (PNG, JPG, GIF, WEBP): vision-capable models see the actual image. Text-only models get a URL placeholder — do NOT claim to "see" the image in that case; say you can fetch a description from a vision tool instead.
+- PDFs: Anthropic, OpenAI (gpt-4o+), and Gemini all read PDFs natively. For other models, use `read_file` to extract the text, or `exec` with `pdftotext` if available.
+- Text/code/markdown/CSV/JSON/HTML: read directly — the file content is included in the prompt as plain text.
+- Other binary: use `read_file` (it has a base64 fallback) or shell tools to inspect the bytes.
+
+FILE OUTPUTS (delivering files to the user):
+When the user asks for a downloadable file (PDF, CSV, image, document, code, archive, …) ALWAYS use the `create_file` tool, NOT just `write_file`. The user needs a clickable download link.
+- ONE-CALL pattern (preferred for text formats): pass `contents` inline and `description`. The tool writes the file AND returns a public `download_url` in one shot.
+  Example: `create_file(path: "output/report.csv", description: "Q1 sales report", contents: "name,amount\nAlice,1234\n")`
+- ONE-CALL pattern (binary): pass `contents` as base64 with `encoding: "base64"`. Useful for PDFs, images, archives the model generated.
+- TWO-CALL pattern (large files only): if the file is already on disk from a prior `write_file` or `exec`, just call `create_file(path: "...", description: "...")` and the tool will expose the existing file as a download.
+The returned `download_url` is rendered to the user as a download button. NEVER just `write_file` and say "I saved it" — the user cannot access workspace files. ALWAYS `create_file` so they get a URL.
+Suggested output directory: `output/<descriptive-name>.<ext>`.
+</fileIO>"#;
 
 /// Build the workspace context block — analogous to Copilot's
 /// `<userMessage>{globalAgentContext}</userMessage>` first message.
 fn workspace_context(workspace: &Workspace) -> String {
     format!(
-        "<workspace>\nWorkspace root: {root}\nThe current OS is: {os}\nYou have access to TWO modes of file operations:\n1. Workspace tools (read_file, write_file, apply_patch, list_dir, search, exec) - operate within the workspace root\n2. System-wide tools (read_system_file, write_system_file, list_system_dir, search_system, exec_system) - operate on ANY path on the system\n\nYou also have access to:\n- memory_store/recall/forget - persistent memory that survives between sessions\n- spawn_background_task/list_background_tasks/kill_background_task - long-running background processes\n- http_request/web_scrape - full networking capabilities\n- get_env/get_system_info/get_home_dir - system information and environment variables\n- cloud tools (aws_s3_*, cloud_list_services) - cloud service integrations\n</workspace>",
+        "<workspace>\nWorkspace root: {root}\nThe current OS is: {os}\nYou have access to TWO modes of file operations:\n1. Workspace tools (read_file, write_file, apply_patch, list_dir, search, exec) - operate within the workspace root\n2. System-wide tools (read_system_file, write_system_file, list_system_dir, search_system, exec_system) - operate on ANY path on the system\n\nYou also have access to:\n- create_file - generate a downloadable file (PDF, CSV, image, etc.) and return a public URL. Use this for ANY file the user wants to receive.\n- memory_store/recall/forget - persistent memory that survives between sessions\n- spawn_background_task/list_background_tasks/kill_background_task - long-running background processes\n- http_request/web_scrape - full networking capabilities\n- get_env/get_system_info/get_home_dir - system information and environment variables\n- cloud tools (aws_s3_*, cloud_list_services) - cloud service integrations\n</workspace>",
         root = workspace.root().display(),
         os = std::env::consts::OS,
     )

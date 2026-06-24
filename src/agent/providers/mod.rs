@@ -58,6 +58,11 @@ pub enum FileSource {
     /// Raw bytes base64-encoded. Used when the provider requires inline content
     /// (Anthropic PDFs) or when bytes were fetched by the adapter itself.
     Inline(String),
+    /// Fully-formed `data:<mime>;base64,<...>` URL. Provider receives inline
+    /// content without us having to know its base64 wire format. Used when
+    /// the source URL is a private local-upload path that the provider cannot
+    /// fetch (so we read from disk and embed the bytes ourselves).
+    DataUrl(String),
 }
 
 // ---------------------------------------------------------------------------

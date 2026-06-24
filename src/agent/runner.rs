@@ -353,6 +353,7 @@ async fn run(spec: RunnerSpec, handle: RunHandle) -> Result<()> {
         spec.github_token.clone(),
         spec.channel.clone(),
         spec.user_id,
+        spec.conversation_id,
         spec.db.clone(),
     );
 
@@ -1728,10 +1729,27 @@ async fn build_initial_user_content(
         );
 
         if natively_supported {
+            // If the URL is local (./local_uploads/...) it is NOT publicly
+            // routable, so model providers (OpenAI, Anthropic, Google) cannot
+            // fetch it. Inline the bytes as a base64 data URL so the model
+            // can actually see the file regardless of network topology.
+            let source = match inline_local_as_data_url(&att.url, &mime) {
+                Some(data_url) => {
+                    tracing::info!(
+                        attachment_index = idx,
+                        filename = %label,
+                        mime = %mime,
+                        data_url_len = data_url.len(),
+                        "attachment_inlined_as_data_url"
+                    );
+                    FileSource::DataUrl(data_url)
+                }
+                None => FileSource::Url(att.url.clone()),
+            };
             let part = FilePart {
                 filename: label.to_string(),
                 media_type: mime.to_string(),
-                source: FileSource::Url(att.url.clone()),
+                source,
             };
             match adapter.convert_file_part(client, &part).await {
                 Ok(block) => {
@@ -1765,7 +1783,7 @@ async fn build_initial_user_content(
         // For binary files where extraction fails we still emit a metadata
         // block with the local path so the model can investigate via its
         // shell / read tools.
-        push_text_fallback(&mut parts, att, label, mime);
+        push_text_fallback_async(client, &mut parts, att, label, mime).await;
     }
 
     let preview: Vec<String> = parts
@@ -1792,14 +1810,58 @@ async fn build_initial_user_content(
     Ok(Value::Array(parts))
 }
 
+/// If `url` points to a local upload (`./local_uploads/...`), read the file
+/// from disk and return a fully-formed `data:<mime>;base64,<...>` URL. This
+/// is what lets vision-capable models actually SEE images/PDFs when the
+/// upload is local (S3 uploads already work via URL pass-through).
+///
+/// Returns `None` for non-local URLs, for files that don't exist on disk,
+/// or for files larger than `MAX_INLINE_BYTES` (we don't want to blow up
+/// the request body with a giant PDF).
+const MAX_INLINE_BYTES: u64 = 20 * 1024 * 1024; // 20 MB
+
+fn inline_local_as_data_url(url: &str, mime: &str) -> Option<String> {
+    use base64ct::{Base64, Encoding};
+    // Only handle the local uploads route — S3 URLs are already public and
+    // model providers can fetch them directly.
+    if !url.contains("/local-uploads/") {
+        return None;
+    }
+    let raw = url.rsplit('/').next()?;
+    let filename = urlencoding::decode(raw)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| raw.to_string());
+    let path = std::path::Path::new("./local_uploads").join(&filename);
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_INLINE_BYTES {
+        return None;
+    }
+    // Use a stable mime type if the upload didn't carry one.
+    let effective_mime = if mime.is_empty() {
+        mime_guess::from_path(&path)
+            .first_or_octet_stream()
+            .to_string()
+    } else {
+        mime.to_string()
+    };
+    let b64 = Base64::encode_string(&bytes);
+    Some(format!("data:{};base64,{}", effective_mime, b64))
+}
+
 /// Best-effort inline-text fallback for attachments the model can't receive
 /// natively (PDF on gpt-4.1, anything on OpenRouter, scanned PDFs without
 /// OCR, raw binary, …). Fetches local uploads directly from disk (no network
 /// round-trip) and remote URLs over HTTP. Always emits something useful so
 /// the model is never left with a bare URL it can't fetch.
-fn push_text_fallback(parts: &mut Vec<Value>, att: &AttachmentInput, label: &str, mime: &str) {
+async fn push_text_fallback_async(
+    client: &reqwest::Client,
+    parts: &mut Vec<Value>,
+    att: &AttachmentInput,
+    label: &str,
+    mime: &str,
+) {
     let local_path = local_uploads_path(&att.url);
-    let content = fetch_file_content_sync(&att.url);
+    let content = fetch_file_content_async(client, &att.url).await;
     match content {
         Some(ref text_content) if text_content.len() <= 200_000 => {
             tracing::info!(
@@ -1881,11 +1943,11 @@ fn local_uploads_path(url: &str) -> Option<String> {
     Some(format!("./local_uploads/{decoded}"))
 }
 
-/// Attempt to read file content from a URL (blocking, best-effort).
+/// Attempt to read file content from a URL (async, best-effort).
 /// Used to inline text file contents into the LLM context.
 /// Returns a descriptive error string for binary/unreadable files so the
 /// model receives honest context instead of a bare URL it tries to web_fetch.
-fn fetch_file_content_sync(url: &str) -> Option<String> {
+async fn fetch_file_content_async(client: &reqwest::Client, url: &str) -> Option<String> {
     // For local uploads, read directly from disk (avoids network round-trip
     // and works even when the server's bind address is not publicly routable).
     if url.contains("/local-uploads/") {
@@ -1895,145 +1957,103 @@ fn fetch_file_content_sync(url: &str) -> Option<String> {
             .map(|s| s.into_owned())
             .unwrap_or_else(|_| raw_filename.to_string());
         let path = std::path::Path::new("./local_uploads").join(&filename);
-        tracing::debug!(url = %url, path = %path.display(), "fetch_file_content_sync: reading local file");
-        let bytes = match std::fs::read(&path) {
+        tracing::debug!(url = %url, path = %path.display(), "fetch_file_content_async: reading local file");
+        let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(e) => {
-                tracing::error!(url = %url, path = %path.display(), error = %e, "fetch_file_content_sync: disk read failed");
+                tracing::error!(url = %url, path = %path.display(), error = %e, "fetch_file_content_async: disk read failed");
                 return None;
             }
         };
-        // Detect PDF by magic bytes — extract text using the pure-Rust
-        // `pdf-extract` crate (works on all platforms without an OS-level
-        // `pdftotext` install), with OS-tool fallback for edge cases.
-        if bytes.starts_with(b"%PDF") {
-            tracing::info!(url = %url, bytes = bytes.len(), "fetch_file_content_sync: PDF detected, extracting text");
-            if let Some(text) = extract_pdf_text_from_bytes(&bytes) {
-                tracing::info!(url = %url, chars = text.len(), "fetch_file_content_sync: PDF text extracted via pdf-extract crate");
-                return Some(format!("[PDF content extracted from: {}]\n\n{}", url, text));
-            }
-            // Fall back to OS-level extractors (poppler / pdfplumber) for
-            // PDFs that pdf-extract can't handle (rare).
-            if let Some(text) = extract_pdf_text_via_exec(&path) {
-                if !text.trim().is_empty() {
-                    tracing::info!(url = %url, chars = text.len(), "fetch_file_content_sync: PDF text extracted via OS tool fallback");
-                    return Some(format!("[PDF content extracted from: {}]\n\n{}", url, text));
-                }
-            }
-            tracing::warn!(url = %url, "fetch_file_content_sync: PDF text extraction failed across all extractors");
-            return Some(format!(
-                "[This is a PDF file ({} bytes). Text extraction was attempted but the file may be image-only / scanned. \
-                 If you need its content, copy-paste the text, or install poppler-utils (`apt install poppler-utils` / `brew install poppler`) for OCR fallback.]",
-                bytes.len()
-            ));
-        }
-        // Detect DOCX (ZIP with word/document.xml)
-        if bytes.starts_with(b"PK\x03\x04") {
-            // Try DOCX extraction
-            let docx_text = extract_docx_text(&bytes);
-            if let Some(text) = docx_text {
-                tracing::info!(url = %url, chars = text.len(), "fetch_file_content_sync: DOCX text extracted");
-                return Some(format!("[DOCX content extracted from: {}]\n\n{}", url, text));
-            }
-            // Try XLSX extraction
-            let xlsx_text = extract_xlsx_text(&bytes);
-            if let Some(text) = xlsx_text {
-                tracing::info!(url = %url, chars = text.len(), "fetch_file_content_sync: XLSX text extracted");
-                return Some(format!("[XLSX content extracted from: {}]\n\n{}", url, text));
-            }
-            // Generic ZIP — can't extract meaningful text
-            tracing::info!(url = %url, bytes = bytes.len(), "fetch_file_content_sync: ZIP/Office file, extraction not possible");
-            return Some(format!(
-                "[Office/ZIP file ({} bytes). Could not extract text. \
-                 Try using exec_system to run a conversion tool, or ask the user to provide content as text.]",
-                bytes.len()
-            ));
-        }
-        // Generic binary heuristic: >30% non-printable bytes in first 512
-        let sample = &bytes[..bytes.len().min(512)];
-        let non_printable = sample
-            .iter()
-            .filter(|&&b| b < 0x09 || (b > 0x0D && b < 0x20) || b == 0x7F)
-            .count();
-        if non_printable * 10 > sample.len() * 3 {
-            tracing::info!(url = %url, bytes = bytes.len(), non_printable, "fetch_file_content_sync: binary file detected, returning guidance message");
-            return Some(format!(
-                "[Binary file ({} bytes) — cannot be read as plain text. \
-                 Ask the user to provide the content in a text format.]",
-                bytes.len()
-            ));
-        }
-        let result = String::from_utf8(bytes).ok();
-        tracing::info!(url = %url, success = result.is_some(), "fetch_file_content_sync: local file read complete");
-        return result;
+        return process_file_bytes(url, &bytes);
     }
-    // For remote URLs, download bytes and run the same content-type-aware
-    // extraction as the local path. Previously this branch called
-    // `resp.text()` which silently dropped binary content (PDFs, images,
-    // Office files) — `String::from_utf8` rejected them and the model
-    // received nothing.
-    tracing::debug!(url = %url, "fetch_file_content_sync: fetching remote url");
-    let client = match reqwest::blocking::Client::builder()
+    // For remote URLs (S3, etc.), download bytes using the async client.
+    tracing::debug!(url = %url, "fetch_file_content_async: fetching remote url");
+    let resp = match client.get(url)
         .timeout(std::time::Duration::from_secs(30))
-        .build()
+        .send()
+        .await
     {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "fetch_file_content_sync: failed to build blocking client");
-            return None;
-        }
-    };
-    let resp = match client.get(url).send() {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(url = %url, error = %e, "fetch_file_content_sync: remote fetch send failed");
+            tracing::warn!(url = %url, error = %e, "fetch_file_content_async: remote fetch failed");
             return None;
         }
     };
     if !resp.status().is_success() {
-        tracing::warn!(url = %url, status = resp.status().as_u16(), "fetch_file_content_sync: remote fetch non-2xx");
+        tracing::warn!(url = %url, status = resp.status().as_u16(), "fetch_file_content_async: remote fetch non-2xx");
         return None;
     }
-    let bytes = match resp.bytes() {
+    let bytes = match resp.bytes().await {
         Ok(b) => b.to_vec(),
         Err(e) => {
-            tracing::warn!(url = %url, error = %e, "fetch_file_content_sync: remote bytes read failed");
+            tracing::warn!(url = %url, error = %e, "fetch_file_content_async: remote bytes read failed");
             return None;
         }
     };
-    tracing::info!(url = %url, bytes = bytes.len(), "fetch_file_content_sync: remote bytes received");
+    tracing::info!(url = %url, bytes = bytes.len(), "fetch_file_content_async: remote bytes received");
+    process_file_bytes(url, &bytes)
+}
 
-    // Content-type-aware extraction. PDF / Office files don't decode as
-    // UTF-8 — they need their own extractors.
+/// Process raw file bytes into text content (PDF extraction, DOCX, plain text).
+fn process_file_bytes(url: &str, bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    // PDF detection
     if bytes.starts_with(b"%PDF") {
-        if let Some(text) = extract_pdf_text_from_bytes(&bytes) {
-            tracing::info!(url = %url, chars = text.len(), "fetch_file_content_sync: remote PDF text extracted via pdf-extract");
+        tracing::info!(url = %url, bytes = bytes.len(), "process_file_bytes: PDF detected, extracting text");
+        if let Some(text) = extract_pdf_text_from_bytes(bytes) {
+            tracing::info!(url = %url, chars = text.len(), "process_file_bytes: PDF text extracted");
             return Some(format!("[PDF content extracted from: {}]\n\n{}", url, text));
         }
-        tracing::warn!(url = %url, "fetch_file_content_sync: remote PDF extraction failed");
+        // Fall back to OS-level extractors for local files
+        let local_path = local_uploads_path(url);
+        if let Some(ref path_str) = local_path {
+            let path = std::path::Path::new(path_str);
+            if let Some(text) = extract_pdf_text_via_exec(path) {
+                if !text.trim().is_empty() {
+                    tracing::info!(url = %url, chars = text.len(), "process_file_bytes: PDF text via OS tool");
+                    return Some(format!("[PDF content extracted from: {}]\n\n{}", url, text));
+                }
+            }
+        }
+        tracing::warn!(url = %url, "process_file_bytes: PDF text extraction failed");
         return Some(format!(
-            "[This is a PDF file ({} bytes) hosted at {}. Text extraction failed — content may be image-only.]",
-            bytes.len(),
-            url
+            "[This is a PDF file ({} bytes). Text extraction was attempted but the file may be image-only / scanned. \
+             If you need its content, copy-paste the text, or install poppler-utils for OCR fallback.]",
+            bytes.len()
         ));
     }
+    // DOCX/XLSX/ZIP detection
     if bytes.starts_with(b"PK\x03\x04") {
-        if let Some(text) = extract_docx_text(&bytes) {
+        if let Some(text) = extract_docx_text(bytes) {
+            tracing::info!(url = %url, chars = text.len(), "process_file_bytes: DOCX text extracted");
             return Some(format!("[DOCX content extracted from: {}]\n\n{}", url, text));
         }
-        if let Some(text) = extract_xlsx_text(&bytes) {
+        if let Some(text) = extract_xlsx_text(bytes) {
+            tracing::info!(url = %url, chars = text.len(), "process_file_bytes: XLSX text extracted");
             return Some(format!("[XLSX content extracted from: {}]\n\n{}", url, text));
         }
         return Some(format!(
-            "[Office/ZIP file ({} bytes) hosted at {}. Could not extract text.]",
-            bytes.len(),
-            url
+            "[Office/ZIP file ({} bytes). Could not extract text.]",
+            bytes.len()
         ));
     }
-    // Plain text — try UTF-8 decode.
-    let result = String::from_utf8(bytes.clone()).ok();
-    tracing::info!(url = %url, success = result.is_some(), "fetch_file_content_sync: remote text decode complete");
-    result
+    // Binary heuristic: >30% non-printable bytes in first 512
+    let sample = &bytes[..bytes.len().min(512)];
+    let non_printable = sample
+        .iter()
+        .filter(|&&b| b < 0x09 || (b > 0x0D && b < 0x20) || b == 0x7F)
+        .count();
+    if non_printable * 10 > sample.len() * 3 {
+        return Some(format!(
+            "[Binary file ({} bytes) — cannot be read as plain text.]",
+            bytes.len()
+        ));
+    }
+    // Plain text
+    String::from_utf8(bytes.to_vec()).ok()
 }
 
 #[cfg(test)]
