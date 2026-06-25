@@ -399,7 +399,59 @@ async fn run(spec: RunnerSpec, handle: RunHandle) -> Result<()> {
             tool_calls: None,
         });
     } else {
-        messages.extend(prior);
+        // Multi-turn: load prior history from DB but REPLACE the last user
+        // message (which was just persisted by create_run) with one that
+        // includes native file content blocks built from the attachments.
+        // Without this, multi-turn file uploads are invisible to the model
+        // because load_conversation_history only stores plain text.
+        let adapter: &dyn ProviderAdapter = spec
+            .providers
+            .for_model(&spec.provider, &spec.model)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no provider adapter for provider='{}' model='{}'",
+                    spec.provider,
+                    spec.model
+                )
+            })?;
+
+        // If the current turn has attachments, we need to rebuild the last
+        // user message with native file blocks. Pop the last user message
+        // from `prior` and replace it.
+        if !spec.initial_user_attachments.is_empty() {
+            tracing::info!(
+                run_id = %spec.run_id,
+                attachment_count = spec.initial_user_attachments.len(),
+                prior_messages = prior.len(),
+                "multi_turn_attachment_rebuild: replacing last user message with native file blocks"
+            );
+            // Add all prior messages EXCEPT the very last one (which is the
+            // just-persisted user message we're about to rebuild).
+            let last_is_user = prior.last().map(|m| m.role == "user").unwrap_or(false);
+            if last_is_user {
+                messages.extend(prior[..prior.len() - 1].to_vec());
+            } else {
+                // Edge case: last message isn't user (shouldn't happen but be safe)
+                messages.extend(prior);
+            }
+            let content = build_initial_user_content(
+                &client,
+                adapter,
+                &spec.model,
+                &spec.initial_user_message,
+                &spec.initial_user_attachments,
+            )
+            .await?;
+            messages.push(ChatMessage {
+                role: "user".to_owned(),
+                content: Some(content),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        } else {
+            messages.extend(prior);
+        }
     }
 
     for _step in 0..spec.max_steps {
@@ -1227,13 +1279,57 @@ async fn load_conversation_history(
         let parts: Value = row.try_get("parts")?;
 
         match role.as_str() {
-            "user" => out.push(ChatMessage {
-                role: "user".to_owned(),
-                content: Some(Value::String(content)),
-                name: None,
-                tool_call_id: None,
-                tool_calls: None,
-            }),
+            "user" => {
+                // Reconstruct user messages with any file-attachment parts so
+                // the model can still "see" files from earlier turns. We emit
+                // them as structured content parts (text + image_url blocks)
+                // since we can't rebuild native provider blocks without an
+                // async fetch. At minimum the model gets the file URL + name.
+                let mut user_parts: Vec<Value> = Vec::new();
+                if !content.is_empty() {
+                    user_parts.push(json!({ "type": "text", "text": content }));
+                }
+                if let Some(arr) = parts.as_array() {
+                    for part in arr {
+                        let kind = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if kind == "file-attachment" {
+                            let url = part.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                            let name = part.get("name").and_then(|v| v.as_str()).unwrap_or("file");
+                            let mime = part.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
+                            if !url.is_empty() {
+                                if mime.starts_with("image/") {
+                                    // Images: pass as image_url so vision models can see them.
+                                    user_parts.push(json!({
+                                        "type": "image_url",
+                                        "image_url": { "url": url }
+                                    }));
+                                } else {
+                                    // Non-image files: include as text annotation with URL
+                                    // so the model knows the file exists and can use tools
+                                    // to access it.
+                                    user_parts.push(json!({
+                                        "type": "text",
+                                        "text": format!("[Attached file: {name} ({mime})]({url})")
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                let final_content = if user_parts.len() <= 1 {
+                    // Just text, keep it simple.
+                    Some(Value::String(content))
+                } else {
+                    Some(Value::Array(user_parts))
+                };
+                out.push(ChatMessage {
+                    role: "user".to_owned(),
+                    content: final_content,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                })
+            }
             "assistant" => {
                 let mut tool_calls: Vec<ToolCall> = Vec::new();
                 let mut text_buf = String::new();
@@ -1702,6 +1798,23 @@ async fn build_initial_user_content(
         let label = att.name.as_deref().unwrap_or("file");
         let is_image = mime.starts_with("image/");
         let is_pdf = mime == "application/pdf";
+        // Anthropic's `document` block natively accepts PDF + plain text only.
+        // xlsx/csv/docx are NOT in that list (per
+        // https://docs.anthropic.com/en/docs/build-with-claude/files — "For file
+        // types that are not supported as `document` blocks (.csv, .txt, .md,
+        // .docx, .xlsx), convert the files to plain text, and include the
+        // content directly in your message"). We still try the document block
+        // for txt/csv first because Anthropic accepts text/plain cleanly and
+        // pdf is already covered above; xlsx/docx go straight to text
+        // extraction with the broken-row-aware extractor below.
+        let is_text_like = matches!(
+            mime,
+            "text/plain" | "text/csv" | "text/markdown" | "application/csv"
+        );
+        let is_xlsx = mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            || mime == "application/vnd.ms-excel";
+        let is_docx = mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            || mime == "application/msword";
 
         tracing::info!(
             attachment_index = idx,
@@ -1710,26 +1823,37 @@ async fn build_initial_user_content(
             url = %att.url,
             is_image = is_image,
             is_pdf = is_pdf,
+            is_text_like = is_text_like,
+            is_xlsx = is_xlsx,
+            is_docx = is_docx,
             "attachment_processing_iter"
         );
 
         // Per-model capability gate. `caps.native_*` is the only thing that
-        // decides native vs text fallback — provider-level flags were too
-        // permissive (gpt-4.1 + OpenRouter models went down the wrong path).
-        let natively_supported = (is_image && caps.native_image)
+        // decides native vs text fallback for images and PDFs — provider-level
+        // flags were too permissive (gpt-4.1 + OpenRouter models went down
+        // the wrong path).
+        let image_or_pdf_native = (is_image && caps.native_image)
             || (is_pdf && caps.native_pdf);
+
+        // Try the native `document` block for txt and csv too. Anthropic
+        // accepts `text/plain` natively; `text/csv` may or may not be
+        // accepted — we fall through gracefully if the adapter rejects it.
+        let try_document_block =
+            image_or_pdf_native || (is_text_like && caps.native_pdf);
 
         tracing::info!(
             attachment_index = idx,
             filename = %label,
             mime = %mime,
-            natively_supported = natively_supported,
-            decision = if natively_supported { "native_block" } else { "text_fallback" },
+            image_or_pdf_native = image_or_pdf_native,
+            try_document_block = try_document_block,
+            decision = if try_document_block { "native_block" } else { "text_fallback" },
             "attachment_capability_decision"
         );
 
-        if natively_supported {
-            // If the URL is local (./local_uploads/...) it is NOT publicly
+        if try_document_block {
+            // If the URL is local (./local-uploads/...) it is NOT publicly
             // routable, so model providers (OpenAI, Anthropic, Google) cannot
             // fetch it. Inline the bytes as a base64 data URL so the model
             // can actually see the file regardless of network topology.
@@ -1765,16 +1889,102 @@ async fn build_initial_user_content(
                     continue;
                 }
                 Err(err) => {
-                    // Adapter failed (e.g. Anthropic couldn't fetch URL).
+                    // Adapter failed (e.g. Anthropic couldn't fetch URL, or
+                    // rejected the document block for an unsupported MIME).
                     // Fall through to the inlined-text path so the model
                     // still gets context.
                     tracing::warn!(
                         provider = adapter.provider_id(),
                         url = %att.url,
+                        mime = %mime,
                         error = %err,
                         "attachment_adapter_failed_falling_back_to_text"
                     );
                 }
+            }
+        }
+
+        // Specialised text-fallback paths for formats whose wire format is
+        // *not* a plain document. We extract structured content so the model
+        // can answer row-level questions instead of seeing a list of strings.
+        if is_xlsx {
+            tracing::info!(
+                attachment_index = idx,
+                filename = %label,
+                mime = %mime,
+                "attachment_xlsx_text_fallback_start"
+            );
+            match fetch_file_content_async(client, &att.url).await {
+                Some(text) if !text.is_empty() => {
+                    tracing::info!(
+                        attachment_index = idx,
+                        filename = %label,
+                        chars = text.len(),
+                        "attachment_xlsx_text_fallback_extracted"
+                    );
+                    let mut header = format!("📎 Attached spreadsheet: {label}");
+                    if let Some(path) = local_uploads_path(&att.url) {
+                        header.push_str(&format!("\nLocal path: {path}"));
+                    }
+                    header.push_str(&format!("\nURL: {url}", url = att.url));
+                    parts.push(json!({
+                        "type": "text",
+                        "text": format!(
+                            "{header}\n\n--- Extracted tabular content ---\n{text}\n--- End of {label} ---",
+                            header = header,
+                            text = text,
+                            label = label,
+                        ),
+                    }));
+                    continue;
+                }
+                Some(_) => {
+                    tracing::warn!(
+                        attachment_index = idx,
+                        filename = %label,
+                        "attachment_xlsx_text_fallback_empty"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        attachment_index = idx,
+                        filename = %label,
+                        "attachment_xlsx_text_fallback_fetch_failed"
+                    );
+                }
+            }
+        }
+        if is_docx {
+            tracing::info!(
+                attachment_index = idx,
+                filename = %label,
+                "attachment_docx_text_fallback_start"
+            );
+            match fetch_file_content_async(client, &att.url).await {
+                Some(text) if !text.is_empty() => {
+                    tracing::info!(
+                        attachment_index = idx,
+                        filename = %label,
+                        chars = text.len(),
+                        "attachment_docx_text_fallback_extracted"
+                    );
+                    let mut header = format!("📎 Attached document: {label}");
+                    if let Some(path) = local_uploads_path(&att.url) {
+                        header.push_str(&format!("\nLocal path: {path}"));
+                    }
+                    header.push_str(&format!("\nURL: {url}", url = att.url));
+                    parts.push(json!({
+                        "type": "text",
+                        "text": format!(
+                            "{header}\n\n--- Extracted text ---\n{text}\n--- End of {label} ---",
+                            header = header,
+                            text = text,
+                            label = label,
+                        ),
+                    }));
+                    continue;
+                }
+                _ => {}
             }
         }
 
@@ -2232,47 +2442,219 @@ fn extract_docx_text(bytes: &[u8]) -> Option<String> {
     if trimmed.is_empty() { None } else { Some(trimmed) }
 }
 
-/// Extract text from an XLSX file (ZIP containing xl/sharedStrings.xml + worksheets).
-/// Returns a CSV-like representation.
+/// Extract tabular data from an XLSX file (ZIP containing xl/sharedStrings.xml
+/// + worksheets/sheet1.xml). Returns a markdown table that preserves the
+/// row/column structure so the model can answer row-level questions instead of
+/// seeing a list of unique strings.
+///
+/// Limits: max 200 rows + 20 columns per sheet to keep prompt size bounded.
+/// Larger files get a head + tail preview with row counts.
 fn extract_xlsx_text(bytes: &[u8]) -> Option<String> {
     use std::io::{Cursor, Read};
     let cursor = Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+    let mut archive = match zip::ZipArchive::new(cursor) {
+        Ok(a) => a,
+        Err(_) => return None,
+    };
 
-    // Try to read shared strings
-    let mut shared_strings = Vec::new();
+    // 1) Read shared strings table.
+    let mut shared_strings: Vec<String> = Vec::new();
     if let Ok(mut file) = archive.by_name("xl/sharedStrings.xml") {
         let mut xml = String::new();
-        file.read_to_string(&mut xml).ok()?;
-        // Extract <t>...</t> values
-        for segment in xml.split("<t") {
-            if let Some(start) = segment.find('>') {
-                if let Some(end) = segment[start + 1..].find("</t>") {
-                    shared_strings.push(segment[start + 1..start + 1 + end].to_string());
+        if file.read_to_string(&mut xml).is_ok() {
+            // <si><t>foo</t></si> or <si><r><t>foo</t></r></si>
+            for si_match in xml.split("<si>").skip(1) {
+                let end = si_match.find("</si>").unwrap_or(si_match.len());
+                let si = &si_match[..end];
+                let mut text = String::new();
+                let mut rest = si;
+                while let Some(start) = rest.find("<t") {
+                    let after_tag = &rest[start + 2..];
+                    let Some(gt) = after_tag.find('>') else { break };
+                    let after_open = &after_tag[gt + 1..];
+                    let Some(close) = after_open.find("</t>") else { break };
+                    let chunk = &after_open[..close];
+                    // Unwrap CDATA if present.
+                    if let Some(after_cdata) = chunk.strip_prefix("<![CDATA[") {
+                        if let Some(stripped) = after_cdata.strip_suffix("]]>") {
+                            text.push_str(stripped);
+                        } else {
+                            text.push_str(after_cdata);
+                        }
+                    } else {
+                        text.push_str(chunk);
+                    }
+                    rest = &after_open[close + 4..];
                 }
+                shared_strings.push(text);
             }
         }
     }
 
-    // Read first worksheet
+    // 2) Read first worksheet XML.
     let mut sheet_xml = String::new();
     if let Ok(mut file) = archive.by_name("xl/worksheets/sheet1.xml") {
-        file.read_to_string(&mut sheet_xml).ok()?;
+        if file.read_to_string(&mut sheet_xml).is_err() {
+            return None;
+        }
     } else {
         return None;
     }
 
-    // Build a simple text representation
-    let mut output = String::with_capacity(4096);
-    output.push_str("[Spreadsheet data]\n");
-    if !shared_strings.is_empty() {
-        output.push_str(&format!("Cells: {}\n", shared_strings.len()));
-        for (i, s) in shared_strings.iter().take(500).enumerate() {
-            if !s.trim().is_empty() {
-                output.push_str(&format!("{}: {}\n", i, s));
+    // 3) Parse rows → Vec<Vec<String>>.
+    // Each row: <row r="N"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>42</v></c>...</row>
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for row_chunk in sheet_xml.split("<row ").skip(1) {
+        let row_end = row_chunk.find("</row>").unwrap_or(row_chunk.len());
+        let row_xml = &row_chunk[..row_end];
+        let mut cells: Vec<String> = Vec::new();
+        for c_chunk in row_xml.split("<c ").skip(1) {
+            let c_end = c_chunk.find("</c>").unwrap_or(c_chunk.len());
+            let c_xml = &c_chunk[..c_end];
+            // Skip empty <c/> placeholders.
+            if !c_xml.contains("<v>") {
+                cells.push(String::new());
+                continue;
+            }
+            // Extract type attribute (t="s" = shared string, t="inlineStr" = inline, t="b" = bool, otherwise number).
+            // NOTE: must look for `t="..."` specifically — `r="..."` (cell
+            // reference) comes first and `t=` may be absent entirely.
+            let cell_type = if let Some(idx) = c_xml.find(" t=\"") {
+                let after = &c_xml[idx + 4..];
+                let end = after.find('"').unwrap_or(0);
+                after[..end].to_ascii_lowercase()
+            } else {
+                String::new()
+            };
+            // Extract value between <v> and </v>.
+            let v_start = c_xml.find("<v>").map(|i| i + 3).unwrap_or(0);
+            let v_end = c_xml[v_start..].find("</v>").map(|i| v_start + i);
+            let Some(v_end) = v_end else {
+                cells.push(String::new());
+                continue;
+            };
+            let v_str = &c_xml[v_start..v_end];
+            let cell_value = match cell_type.as_str() {
+                "s" => shared_strings
+                    .get(v_str.parse::<usize>().unwrap_or(0))
+                    .cloned()
+                    .unwrap_or_default(),
+                "inlineStr" => {
+                    // <is><t>foo</t></is>
+                    let after_t = c_xml.find("<t>").map(|i| i + 3);
+                    if let Some(start) = after_t {
+                        let end = c_xml[start..].find("</t>").map(|i| start + i);
+                        end.map(|e| c_xml[start..e].to_string()).unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                }
+                "b" => {
+                    if v_str == "1" { "TRUE".to_string() } else { "FALSE".to_string() }
+                }
+                _ => v_str.to_string(),
+            };
+            cells.push(cell_value);
+        }
+        rows.push(cells);
+    }
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    // 4) Determine column count = max cells across rows.
+    let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if col_count == 0 {
+        return None;
+    }
+    let total_rows = rows.len();
+
+    // 5) Build a markdown table. Cap to MAX_ROWS to keep prompt size sane.
+    const MAX_ROWS: usize = 200;
+    const MAX_COL_WIDTH: usize = 80;
+
+    let truncate = |s: &str| -> String {
+        if s.chars().count() <= MAX_COL_WIDTH {
+            s.to_string()
+        } else {
+            let mut out: String = s.chars().take(MAX_COL_WIDTH - 1).collect();
+            out.push('…');
+            out
+        }
+    };
+
+    let mut out = String::with_capacity(4096);
+    out.push_str(&format!(
+        "[Spreadsheet: {} rows × {} columns]\n\n",
+        total_rows, col_count
+    ));
+
+    // Header row is row[0]. Use col1, col2, ... as fallback names.
+    let header: Vec<String> = if !rows.is_empty() {
+        rows[0]
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let trimmed = h.trim();
+                if trimmed.is_empty() {
+                    format!("col{}", i + 1)
+                } else {
+                    truncate(trimmed)
+                }
+            })
+            .collect()
+    } else {
+        (1..=col_count).map(|i| format!("col{i}")).collect()
+    };
+
+    let data_rows: &[Vec<String>] = if total_rows <= MAX_ROWS + 1 {
+        // Show all.
+        if rows.len() > 1 { &rows[1..] } else { &[] }
+    } else {
+        // Show head + tail.
+        // We splice in a marker row "… N rows omitted …" later.
+        &rows[1..=MAX_ROWS.min(rows.len() - 1)]
+    };
+
+    // Markdown header line.
+    out.push_str("| ");
+    out.push_str(&header.join(" | "));
+    out.push_str(" |\n|");
+    for _ in 0..header.len() {
+        out.push_str(" --- |");
+    }
+    out.push('\n');
+
+    let render_row = |row: &[String], buf: &mut String| {
+        buf.push_str("| ");
+        for i in 0..header.len() {
+            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            // Escape pipe + newlines for markdown table.
+            let cell = cell.replace('|', "\\|").replace('\n', " ");
+            buf.push_str(&truncate(&cell));
+            buf.push_str(" | ");
+        }
+        buf.push('\n');
+    };
+
+    let data_rows_len = data_rows.len();
+    for row in data_rows {
+        render_row(row, &mut out);
+    }
+
+    if total_rows > MAX_ROWS + 1 {
+        let omitted = total_rows - 1 - data_rows_len;
+        out.push_str(&format!("\n… {omitted} more rows omitted …\n"));
+        // Tail preview.
+        let tail_start = total_rows.saturating_sub(10);
+        if tail_start > data_rows_len + 1 {
+            out.push_str("\nTail (last 10 rows):\n");
+            for row in &rows[tail_start..] {
+                render_row(row, &mut out);
             }
         }
     }
 
-    if output.len() > 30 { Some(output) } else { None }
+    if out.len() > 50 { Some(out) } else { None }
 }

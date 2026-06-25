@@ -27,6 +27,9 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
+    if let Err(error) = db::migrate(&pool).await {
+        tracing::warn!(error = %error, "operonx: automatic migrations failed; continuing boot so /readyz can report the issue");
+    }
 
     let state = AppState {
         codex: CodexBridge::new(config.codex_command.clone()),
