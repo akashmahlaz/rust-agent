@@ -32,7 +32,8 @@ use uuid::Uuid;
 use super::{
     anthropic, context, events, model_caps,
     openai::{self, ChatMessage, OpenAiEvent, ToolCall, ToolCallFunction},
-    prompt::build_system_message,
+    personalization,
+    prompt::{build_system_message, build_personalized_system_message},
     providers::{FilePart, FileSource, ProviderAdapter, ProviderRegistry},
     tools::{self, AgentContext, Workspace},
     types::{AgentEvent, AttachmentInput, RunId, RunStatus},
@@ -357,12 +358,28 @@ async fn run(spec: RunnerSpec, handle: RunHandle) -> Result<()> {
         spec.db.clone(),
     );
 
+    // Build personalization context (learns from user history)
+    let personalization_ctx = personalization::build_context(
+        &spec.db,
+        spec.user_id,
+        None, // first message not yet available at this point
+    )
+    .await
+    .unwrap_or_else(|_| personalization::PersonalizationContext {
+        profile: personalization::UserProfile::default(),
+        relevant_memories: Vec::new(),
+        recent_patterns: Vec::new(),
+        is_first_session: false,
+    });
+    let personalization_injection = personalization::generate_prompt_injection(&personalization_ctx);
+
     let mut messages: Vec<ChatMessage> = Vec::new();
     messages.push(ChatMessage {
         role: "system".to_owned(),
-        content: Some(Value::String(build_system_message(
+        content: Some(Value::String(build_personalized_system_message(
             &spec.workspace,
             &spec.channel,
+            &personalization_injection,
         ))),
         name: None,
         tool_call_id: None,
@@ -1252,6 +1269,30 @@ async fn run(spec: RunnerSpec, handle: RunHandle) -> Result<()> {
     .await?;
     handle.emit(&events::message_end()).await?;
     set_status(&spec.db, spec.run_id, RunStatus::Completed, None).await?;
+
+    // Post-conversation learning: extract patterns and update user profile
+    let learn_messages: Vec<Value> = messages
+        .iter()
+        .filter_map(|m| serde_json::to_value(m).ok())
+        .collect();
+    tokio::spawn({
+        let db = spec.db.clone();
+        let user_id = spec.user_id;
+        let conversation_id = spec.conversation_id;
+        async move {
+            if let Err(e) = personalization::post_conversation_learn(
+                &db,
+                user_id,
+                conversation_id,
+                &learn_messages,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "post_conversation_learn failed");
+            }
+        }
+    });
+
     Ok(())
 }
 

@@ -4,6 +4,7 @@ pub mod events;
 pub mod github;
 pub mod model_caps;
 pub mod openai;
+pub mod personalization;
 pub mod prompt;
 pub mod providers;
 pub mod registry;
